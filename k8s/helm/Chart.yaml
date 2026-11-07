@@ -1,3 +1,3 @@
 apiVersion: v2
-name: holidayfriend-backend
+name: holidayfriend-server
 version: 0.1.0
