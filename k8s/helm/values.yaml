@@ -1,0 +1,19 @@
+namespace: holidayfriend
+hostname: "holidayfriend.pbonard.com"
+registry: "ghcr.io/pbonard"
+
+circuitBreaker:
+  maxConnections: 100
+  maxPendingRequests: 100 # Limits requests waiting in the queue
+  maxParallelRequests: 100 # Limits active, concurrent HTTP requests
+
+apps:
+  server:
+    image: "holidayfriend/server:latest"
+    port: 8080
+    # longer than the / of web-route, so the gateway sends this path here instead of to the web app
+    routePath: /api
+    # MYSQL_USERNAME and MYSQL_PASSWORD
+    mysql: true
+    memoryRequests: "64Mi"
+    memoryLimits: "128Mi"

@@ -1,0 +1,90 @@
+# applied by hand after the holidayfriend keyspace exists (my-infra vitess-cluster.yaml), outside helm/ so argo cd doesn't run it
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: holidayfriend-schema
+  namespace: vitess
+data:
+  # keep the same as backend/schema.sql
+  create_tables.sql: |
+    -- column lengths match the maxLength of the web app's onboarding form
+    CREATE TABLE profile
+    (
+        id                BINARY(16)   NOT NULL,
+        name              VARCHAR(30)  NOT NULL,
+        based_in_country  VARCHAR(100) NOT NULL,
+        based_in_city     VARCHAR(100) NOT NULL,
+        about_me          VARCHAR(300) NOT NULL DEFAULT '',
+        grew_up_in        VARCHAR(100) NOT NULL DEFAULT '',
+        languages         VARCHAR(100) NOT NULL DEFAULT '',
+        dream_destination VARCHAR(100) NOT NULL DEFAULT '',
+        obsession         VARCHAR(100) NOT NULL DEFAULT '',
+        local_spot        VARCHAR(100) NOT NULL DEFAULT '',
+        best_trip         VARCHAR(100) NOT NULL DEFAULT '',
+        birth_decade      VARCHAR(100) NOT NULL DEFAULT '',
+        fun_fact          VARCHAR(100) NOT NULL DEFAULT '',
+        updated_at        DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (id)
+    );
+
+  vschema.json: |
+    {
+      "sharded": true,
+      "vindexes": {
+        "binary_md5": {
+          "type": "binary_md5"
+        }
+      },
+      "tables": {
+        "profile": {
+          "column_vindexes": [
+            {
+              "column": "id",
+              "name": "binary_md5"
+            }
+          ]
+        }
+      }
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: holidayfriend-schema-job
+  namespace: vitess
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: vtctldclient
+          image: vitess/lite:v24.0.3-mysql80
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              VTCTLD_SERVER="vitess-cluster-vtctld-e819f254.vitess.svc.cluster.local:15999"
+
+              # Declarative: the CREATE TABLE statements are the desired end state.
+              # Missing tables are created, existing ones are ALTERed to match,
+              # unchanged ones become no-op migrations. Runs asynchronously as Online DDL.
+              echo "Submitting declarative schema migrations for keyspace 'holidayfriend'..."
+              vtctldclient --server "$VTCTLD_SERVER" \
+                ApplySchema --ddl-strategy "vitess --declarative" \
+                --sql-file=/schema/create_tables.sql holidayfriend
+
+              echo "Applying VSchema to keyspace 'holidayfriend'..."
+              vtctldclient --server "$VTCTLD_SERVER" \
+                ApplyVSchema --vschema-file=/schema/vschema.json holidayfriend
+
+              echo "Done."
+          volumeMounts:
+            - name: schema
+              mountPath: /schema
+      volumes:
+        - name: schema
+          configMap:
+            name: holidayfriend-schema

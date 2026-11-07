@@ -1,0 +1,63 @@
+{{- range $name, $app := .Values.apps }}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ $name }}-route
+  namespace: {{ $.Values.namespace }}
+  labels:
+    app: {{ $name }}
+spec:
+  parentRefs:
+    - name: cluster-gateway
+      namespace: envoy-gateway-system
+  hostnames:
+    - {{ $.Values.hostname | quote }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ $app.routePath }}
+      backendRefs:
+        - name: {{ $name }}
+          port: 80
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: {{ $name }}-jwt-auth
+  namespace: {{ $.Values.namespace }}
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: {{ $name }}-route
+  jwt:
+    providers:
+      - name: jwt-provider
+        claimToHeaders:
+          - claim: sub
+            header: X-User-Id
+        localJWKS:
+          type: ValueRef
+          valueRef:
+            group: ""
+            kind: ConfigMap
+            # the holidayfriend signing key, made by the my-server chart
+            name: public-key-at
+---
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: {{ $name }}-circuit-breaker
+  namespace: {{ $.Values.namespace }}
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: {{ $name }}-route
+  circuitBreaker:
+    maxConnections: {{ $.Values.circuitBreaker.maxConnections }}
+    maxPendingRequests: {{ $.Values.circuitBreaker.maxPendingRequests }}
+    maxParallelRequests: {{ $.Values.circuitBreaker.maxParallelRequests }}
+{{- end }}

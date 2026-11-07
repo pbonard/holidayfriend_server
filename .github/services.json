@@ -1,0 +1,11 @@
+[
+  {
+    "name": "server",
+    "image": "holidayfriend/server",
+    "dockerfile": "./backend/Dockerfile",
+    "context": "./backend",
+    "paths": [
+      "backend/"
+    ]
+  }
+]

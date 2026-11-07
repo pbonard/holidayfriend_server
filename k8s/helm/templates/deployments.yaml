@@ -1,0 +1,59 @@
+{{- range $name, $app := .Values.apps }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    app: {{ $name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      {{- if hasPrefix "ghcr.io/" $.Values.registry }}
+      imagePullSecrets:
+        - name: ghcr
+      {{- end }}
+      containers:
+        - name: {{ $name }}
+          image: "{{ $.Values.registry }}/{{ $app.image }}"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: {{ $app.port }}
+          {{- if $app.memoryLimits }}
+          resources:
+            requests:
+              memory: {{ $app.memoryRequests }}
+            limits:
+              memory: {{ $app.memoryLimits }}
+          {{- end }}
+          envFrom:
+            # MYSQL_URL and MYSQL_DATABASE, from k8s/config-map.yaml
+            - configMapRef:
+                name: config-map
+            {{- if $app.mysql }}
+            - secretRef:
+                name: mysql
+            {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    app: {{ $name }}
+spec:
+  selector:
+    app: {{ $name }}
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: {{ $app.port }}
+{{- end }}

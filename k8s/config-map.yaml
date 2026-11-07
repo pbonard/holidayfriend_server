@@ -1,0 +1,32 @@
+# holidayfriend: auth and web, on their own keyspace, signing keys and google client (values-holidayfriend.yaml in the chart)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: holidayfriend
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-map
+  namespace: holidayfriend
+data:
+  PROFILE: "holidayfriend"
+  # the web client of the holidayfriend google cloud project
+  GOOGLE_SIGN_IN_WEB_CLIENT_ID: "146765125400-2f5f2ildpicetbo1ebedbs3g9nnbrur4.apps.googleusercontent.com"
+  # sign in gives tokens without the phone step, phone login itself stays available
+  PHONE_VERIFICATION_REQUIRED: "false"
+  # the name in the subject of the emails auth sends
+  APP_NAME: "Holidayfriend"
+  # the name authenticator apps show for the account
+  ISSUER: "Holidayfriend"
+  # login with a code sent to the email, without a password
+  NO_PASSWORD_EMAIL_LOGIN: "true"
+  # the services id of apple sign in on the web, the audience of its tokens
+  BUNDLE_IDENTIFIER: "com.xcecv.holidayfriend.web"
+  FROM_EMAIL: "wsxc20xx@gmail.com"
+  FROM_EMAIL_SMTP: "smtp.gmail.com"
+  SMTP_ADDR: "smtp.gmail.com:587"
+  K8SSANDRA_HOST: "k8ssandra-cluster-dc1-service.k8ssandra.svc.cluster.local"
+  K8SSANDRA_CA_CERT_PATH: "/cert/k8ssandra/ca.crt"
+  MYSQL_URL: "vitess-cluster-zone1-vtgate-07109f85.vitess.svc.cluster.local:3306"
+  MYSQL_DATABASE: "holidayfriend"
