@@ -1,33 +1,14 @@
-use axum::{
-    Json,
-    extract::{FromRequestParts, State},
-    http::{StatusCode, request::Parts},
-};
+use axum::{Json, extract::State, http::StatusCode};
 use mysql_async::{Pool, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::{location, user::UserId};
 
 const MAX_NAME: usize = 30;
 const MAX_PLACE: usize = 100;
 const MAX_ABOUT_ME: usize = 300;
 const MAX_PROMPT: usize = 100;
-
-/// The member the gateway verified the access token of, it sets the header from the `sub` claim.
-pub struct UserId(Uuid);
-
-impl<S: Sync> FromRequestParts<S> for UserId {
-    type Rejection = (StatusCode, &'static str);
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .headers
-            .get("X-User-Id")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| Uuid::parse_str(value).ok())
-            .map(UserId)
-            .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid X-User-Id"))
-    }
-}
 
 /// The fields of `ProfileFormValue` in the web app, the ones left out count as empty.
 #[derive(Debug, Default, Deserialize)]
@@ -62,6 +43,10 @@ impl SaveProfileRequest {
             "Select your country",
         )?;
         check(&self.based_in_city, MAX_PLACE, true, "Select your city")?;
+        // the pair the web app's pickers offer, not just anything entered
+        if !location::is_city(self.based_in_country.trim(), self.based_in_city.trim()) {
+            return Err("Select your city from the list");
+        }
         check(&self.about_me, MAX_ABOUT_ME, false, "About me is too long")?;
 
         let prompts = [
@@ -106,7 +91,7 @@ pub async fn save(
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
     upsert(&pool, user_id, &profile).await.map_err(|err| {
-        eprintln!("fail to save profile of {user_id}: {err}");
+        tracing::error!(error = %err, "fail to save profile");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save profile")
     })?;
 
@@ -172,7 +157,7 @@ pub async fn get_brief(
     State(pool): State<Pool>,
 ) -> Result<Json<GetBriefProfileResponse>, (StatusCode, &'static str)> {
     let brief = select_brief(&pool, user_id).await.map_err(|err| {
-        eprintln!("fail to get profile brief of {user_id}: {err}");
+        tracing::error!(error = %err, "fail to get profile brief");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get profile")
     })?;
 
@@ -238,6 +223,24 @@ mod tests {
     fn rejects_a_missing_city() {
         let profile = SaveProfileRequest {
             based_in_city: String::new(),
+            ..valid()
+        };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_city_that_isnt_listed() {
+        let profile = SaveProfileRequest {
+            based_in_city: "Atlantis".into(),
+            ..valid()
+        };
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_a_city_of_another_country() {
+        let profile = SaveProfileRequest {
+            based_in_city: "Tokyo".into(),
             ..valid()
         };
         assert!(profile.validate().is_err());
