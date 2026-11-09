@@ -1,14 +1,25 @@
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::StatusCode,
+};
 use mysql_async::{Conn, Pool, TxOpts, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{location, user::UserId};
+use crate::{
+    location,
+    place::Place,
+    profile::{self, AuthorBasedIn},
+    user::UserId,
+};
 
 // reddit's limits, the same as the maxLength of the web app's post form
 const MAX_TITLE: usize = 300;
 const MAX_BODY: usize = 40_000;
 const MAX_PLACES: usize = 10;
+// posts per page of a city's feed. a page shorter than this is the last one, the web app stops there
+const FEED_PAGE_SIZE: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -24,14 +35,6 @@ impl PostRole {
             PostRole::Traveler => "traveler",
         }
     }
-}
-
-/// One of the cities of the web app's list, the same pair as the profile's based in.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct Place {
-    /// ISO 3166-1 alpha-2
-    country: String,
-    city: String,
 }
 
 /// `CreatePostRequest` in the web app.
@@ -131,7 +134,7 @@ pub async fn create(
     // every post has a city, so a city's posts are both its travelers' and its locals'.
     // a local's is copied, so their posts keep the city they were written in when they move
     if post.role == PostRole::Local {
-        let based_in = select_based_in(&mut conn, user_id)
+        let based_in = profile::select_based_in(&mut conn, user_id)
             .await
             .map_err(failed)?
             // onboarding saves the profile before anything else can be done
@@ -156,21 +159,6 @@ pub async fn create(
 fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
     tracing::error!(error = %err, "fail to create post");
     (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create post")
-}
-
-async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Result<Option<Place>> {
-    let row: Option<(String, String)> = conn
-        .exec_first(
-            r"-- sql
-    SELECT based_in_country, based_in_city
-    FROM profile
-    WHERE id = :user_id",
-            params! {
-                "user_id" => user_id.as_bytes().to_vec(),
-            },
-        )
-        .await?;
-    Ok(row.map(|(country, city)| Place { country, city }))
 }
 
 /// The post and its places together or not at all. both are sharded by the post's id, so it's one shard's transaction.
@@ -211,6 +199,147 @@ async fn insert(
     .await?;
 
     tx.commit().await
+}
+
+/// `GET /posts`: a city's posts, newest first.
+#[derive(Debug, Deserialize)]
+pub struct ListPostsQuery {
+    /// ISO 3166-1 alpha-2
+    country: String,
+    city: String,
+    /// only locals' or only travelers' posts, both when left out
+    role: Option<PostRole>,
+    /// the last post id of the page before, the posts older than it come next. the first page leaves it out.
+    /// a post id and not a page number, so posts written while scrolling don't shift the pages
+    before: Option<String>,
+}
+
+/// `PostFeedItem` in the web app.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostFeedItem {
+    id: String,
+    role: String,
+    title: String,
+    body: String,
+    author_name: String,
+    /// where the author's profile is based in, as much as they show: for the web app to tell a viewer
+    /// from the same city or country. none when they show neither, or the profile is gone
+    author_based_in: Option<AuthorBasedIn>,
+    /// every city of the post, the one being explored too. a local's post has just theirs
+    places: Vec<Place>,
+}
+
+pub async fn list(
+    _: UserId,
+    State(pool): State<Pool>,
+    Query(query): Query<ListPostsQuery>,
+) -> Result<Json<Vec<PostFeedItem>>, (StatusCode, &'static str)> {
+    let country = query.country.trim();
+    let city = query.city.trim();
+    if !location::is_city(country, city) {
+        return Err((StatusCode::BAD_REQUEST, "The city is invalid"));
+    }
+    let before = query
+        .before
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "The page is invalid"))?;
+    select_city_posts(&pool, country, city, query.role, before)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            tracing::error!(error = %err, "fail to list posts");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load posts")
+        })
+}
+
+/// id, user_id, role, title, body, and every city of the post as a json array of places
+type PostRow = (Vec<u8>, Vec<u8>, String, String, String, String);
+
+/// Two round trips: the posts with their cities, then their authors.
+/// a post's places are on its own shard, so the joins and the grouping by post id all stay in each shard.
+/// a city's posts are on every shard, vtgate asks them all and merges by id, which is the newest first since
+/// post ids are uuid v7.
+async fn select_city_posts(
+    pool: &Pool,
+    country: &str,
+    city: &str,
+    role: Option<PostRole>,
+    before: Option<Uuid>,
+) -> mysql_async::Result<Vec<PostFeedItem>> {
+    let mut conn = pool.get_conn().await?;
+    let posts: Vec<PostRow> = conn
+        .exec(
+            format!(
+                r"-- sql
+    SELECT
+        post.id,
+        post.user_id,
+        post.role,
+        post.title,
+        post.body,
+        JSON_ARRAYAGG(JSON_OBJECT('country', place.country, 'city', place.city))
+    FROM post_place AS here
+    JOIN post ON post.id = here.post_id
+    -- every city of the post, not only the one asked for
+    JOIN post_place AS place ON place.post_id = post.id
+    WHERE here.country = :country AND here.city = :city
+        AND (:role IS NULL OR post.role = :role)
+        AND (:before IS NULL OR post.id < :before)
+    GROUP BY post.id
+    ORDER BY post.id DESC
+    LIMIT {FEED_PAGE_SIZE}"
+            ),
+            params! {
+                "country" => country,
+                "city" => city,
+                "role" => role.map(PostRole::as_str),
+                "before" => before.map(|before| before.as_bytes().to_vec()),
+            },
+        )
+        .await?;
+    if posts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // the authors' profiles are sharded by their own id, so they're read apart instead of joined
+    let authors = profile::select_authors(
+        &mut conn,
+        posts.iter().map(|(_, user_id, ..)| user_id).collect(),
+    )
+    .await?;
+
+    Ok(posts
+        .into_iter()
+        .map(|(id, user_id, role, title, body, places)| PostFeedItem {
+            places: parse_places(&places),
+            // BINARY(16), so always the 16 bytes of a uuid
+            id: Uuid::from_slice(&id)
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            role,
+            title,
+            body,
+            author_name: authors
+                .get(&user_id)
+                .map(|author| author.name.clone())
+                .unwrap_or_default(),
+            author_based_in: authors
+                .get(&user_id)
+                .and_then(|author| author.based_in.clone()),
+        })
+        .collect())
+}
+
+/// The json array JSON_ARRAYAGG built. mysql made it, so it's always this shape: a post shows
+/// without its cities rather than failing the whole page if it ever isn't
+fn parse_places(json: &str) -> Vec<Place> {
+    serde_json::from_str(json).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "fail to read a post's places");
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -356,6 +485,28 @@ mod tests {
             ..traveler()
         };
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn reads_the_places_json_arrayagg_builds() {
+        let places = parse_places(
+            r#"[{"city": "Tokyo", "country": "JP"}, {"city": "Kyoto", "country": "JP"}]"#,
+        );
+        assert_eq!(
+            places,
+            vec![
+                tokyo(),
+                Place {
+                    country: "JP".into(),
+                    city: "Kyoto".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_broken_places_as_none() {
+        assert!(parse_places("not json").is_empty());
     }
 
     #[test]

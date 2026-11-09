@@ -1,14 +1,38 @@
+use std::collections::HashMap;
+
 use axum::{Json, extract::State, http::StatusCode};
-use mysql_async::{Pool, params, prelude::Queryable};
+use mysql_async::{Conn, Pool, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{location, user::UserId};
+use crate::{location, place::Place, user::UserId};
 
 const MAX_NAME: usize = 30;
 const MAX_PLACE: usize = 100;
 const MAX_ABOUT_ME: usize = 300;
 const MAX_PROMPT: usize = 100;
+
+/// How much of where they're based in a person shows on their posts. one value and not a toggle each,
+/// so showing the city without the country can't be saved.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShowBasedIn {
+    /// the city and its country
+    #[default]
+    City,
+    Country,
+    None,
+}
+
+impl ShowBasedIn {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShowBasedIn::City => "city",
+            ShowBasedIn::Country => "country",
+            ShowBasedIn::None => "none",
+        }
+    }
+}
 
 /// The fields of `ProfileFormValue` in the web app, the ones left out count as empty.
 #[derive(Debug, Default, Deserialize)]
@@ -26,6 +50,8 @@ pub struct SaveProfileRequest {
     best_trip: String,
     birth_decade: String,
     fun_fact: String,
+    /// left out, the city and country are shown, as before there was a choice
+    show_based_in: ShowBasedIn,
 }
 
 impl SaveProfileRequest {
@@ -108,10 +134,10 @@ async fn upsert(
         r"-- sql
     INSERT INTO profile (
         id, name, based_in_country, based_in_city, about_me, grew_up_in, languages,
-        dream_destination, obsession, local_spot, best_trip, birth_decade, fun_fact
+        dream_destination, obsession, local_spot, best_trip, birth_decade, fun_fact, show_based_in
     ) VALUES (
         :user_id, :name, :based_in_country, :based_in_city, :about_me, :grew_up_in, :languages,
-        :dream_destination, :obsession, :local_spot, :best_trip, :birth_decade, :fun_fact
+        :dream_destination, :obsession, :local_spot, :best_trip, :birth_decade, :fun_fact, :show_based_in
     ) ON DUPLICATE KEY UPDATE
         name = VALUES(name),
         based_in_country = VALUES(based_in_country),
@@ -124,7 +150,8 @@ async fn upsert(
         local_spot = VALUES(local_spot),
         best_trip = VALUES(best_trip),
         birth_decade = VALUES(birth_decade),
-        fun_fact = VALUES(fun_fact)",
+        fun_fact = VALUES(fun_fact),
+        show_based_in = VALUES(show_based_in)",
         params! {
             "user_id" => user_id.as_bytes().to_vec(),
             "name" => profile.name.trim(),
@@ -139,6 +166,7 @@ async fn upsert(
             "best_trip" => profile.best_trip.trim(),
             "birth_decade" => profile.birth_decade.trim(),
             "fun_fact" => profile.fun_fact.trim(),
+            "show_based_in" => profile.show_based_in.as_str(),
         },
     )
     .await
@@ -192,9 +220,110 @@ async fn select_brief(
     ))
 }
 
+/// Where a person is based in, to place a local's post in their city. what they show doesn't matter here:
+/// a local's post is in their city either way
+pub async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Result<Option<Place>> {
+    let row: Option<(String, String)> = conn
+        .exec_first(
+            r"-- sql
+    SELECT based_in_country, based_in_city
+    FROM profile
+    WHERE id = :user_id",
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.map(|(country, city)| Place { country, city }))
+}
+
+/// `AuthorBasedIn` in the web app.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthorBasedIn {
+    country: String,
+    /// none when the author shows only their country
+    city: Option<String>,
+}
+
+impl AuthorBasedIn {
+    /// the columns select_authors leaves NULL for what an author hides: no country is nothing shown
+    fn from_columns(country: Option<String>, city: Option<String>) -> Option<Self> {
+        country.map(|country| AuthorBasedIn { country, city })
+    }
+}
+
+/// A post's author as anyone else sees them.
+pub struct Author {
+    pub name: String,
+    /// as much as they show, none when they show neither
+    pub based_in: Option<AuthorBasedIn>,
+}
+
+/// id, name, and the based in country and city, NULL for what's hidden
+type AuthorRow = (Vec<u8>, String, Option<String>, Option<String>);
+
+/// The authors with these user ids, by id. only what each one shows leaves the database, the rest comes back
+/// NULL, and a show_based_in that's neither 'city' nor 'country' hides both.
+/// profiles are sharded by their id, so this IN of primary vindex values goes only to the shards that hold them
+pub async fn select_authors(
+    conn: &mut Conn,
+    mut user_ids: Vec<&Vec<u8>>,
+) -> mysql_async::Result<HashMap<Vec<u8>, Author>> {
+    // one author of several posts is asked for once
+    user_ids.sort();
+    user_ids.dedup();
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<AuthorRow> = conn
+        .exec(
+            format!(
+                r"-- sql
+    SELECT
+        id,
+        name,
+        CASE WHEN show_based_in IN ('city', 'country') THEN based_in_country END,
+        CASE WHEN show_based_in = 'city' THEN based_in_city END
+    FROM profile
+    WHERE id IN ({})",
+                vec!["?"; user_ids.len()].join(", ")
+            ),
+            user_ids,
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, country, city)| {
+            let based_in = AuthorBasedIn::from_columns(country, city);
+            (id, Author { name, based_in })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_shown_city_and_country() {
+        let based_in =
+            AuthorBasedIn::from_columns(Some("KR".into()), Some("Seoul".into())).unwrap();
+        assert_eq!(
+            (based_in.country.as_str(), based_in.city.as_deref()),
+            ("KR", Some("Seoul"))
+        );
+    }
+
+    #[test]
+    fn reads_a_shown_country_alone() {
+        let based_in = AuthorBasedIn::from_columns(Some("KR".into()), None).unwrap();
+        assert_eq!((based_in.country.as_str(), based_in.city), ("KR", None));
+    }
+
+    #[test]
+    fn reads_nothing_shown_as_none() {
+        assert!(AuthorBasedIn::from_columns(None, None).is_none());
+    }
 
     fn valid() -> SaveProfileRequest {
         SaveProfileRequest {
@@ -208,6 +337,36 @@ mod tests {
     #[test]
     fn accepts_the_required_fields_alone() {
         assert!(valid().validate().is_ok());
+    }
+
+    fn show_based_in_of(json: &str) -> serde_json::Result<ShowBasedIn> {
+        serde_json::from_str::<SaveProfileRequest>(json).map(|profile| profile.show_based_in)
+    }
+
+    #[test]
+    fn reads_what_of_the_based_in_is_shown() {
+        assert_eq!(
+            show_based_in_of(r#"{"showBasedIn":"city"}"#).unwrap(),
+            ShowBasedIn::City
+        );
+        assert_eq!(
+            show_based_in_of(r#"{"showBasedIn":"country"}"#).unwrap(),
+            ShowBasedIn::Country
+        );
+        assert_eq!(
+            show_based_in_of(r#"{"showBasedIn":"none"}"#).unwrap(),
+            ShowBasedIn::None
+        );
+    }
+
+    #[test]
+    fn shows_the_city_when_left_out() {
+        assert_eq!(show_based_in_of("{}").unwrap(), ShowBasedIn::City);
+    }
+
+    #[test]
+    fn rejects_an_unknown_show_based_in() {
+        assert!(show_based_in_of(r#"{"showBasedIn":"everyone"}"#).is_err());
     }
 
     #[test]
