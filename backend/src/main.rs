@@ -1,4 +1,5 @@
 mod location;
+mod place;
 mod post;
 mod profile;
 mod user;
@@ -52,7 +53,7 @@ async fn main() {
     // the gateway sends everything under /api here and keeps the prefix in the path
     let api = Router::new()
         .route("/profile", put(profile::save).get(profile::get_brief))
-        .route("/posts", post(post::create));
+        .route("/posts", post(post::create).get(post::list));
     let app = Router::new()
         .nest("/api", api)
         // one line per request, with what it was and how it went

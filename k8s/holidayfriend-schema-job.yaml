@@ -22,6 +22,9 @@ data:
         best_trip         VARCHAR(100) NOT NULL DEFAULT '',
         birth_decade      VARCHAR(100) NOT NULL DEFAULT '',
         fun_fact          VARCHAR(100) NOT NULL DEFAULT '',
+        -- how much of the based in shows on their posts: 'city' (and its country), 'country' or 'none'.
+        -- one column so a city without its country can't be saved. profiles from before the choice show the city
+        show_based_in     VARCHAR(10)  NOT NULL DEFAULT 'city',
         updated_at        DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
         PRIMARY KEY (id)
     );
