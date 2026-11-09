@@ -8,4 +8,10 @@ axum = "0.8.9"
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.54.1", features = ["full"] }
-uuid = "1.29.0"
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+uuid = { version = "1.29.0", features = ["v7"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"

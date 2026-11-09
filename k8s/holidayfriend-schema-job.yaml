@@ -5,7 +5,6 @@ metadata:
   name: holidayfriend-schema
   namespace: vitess
 data:
-  # keep the same as backend/schema.sql
   create_tables.sql: |
     -- column lengths match the maxLength of the web app's onboarding form
     CREATE TABLE profile
@@ -27,12 +26,60 @@ data:
         PRIMARY KEY (id)
     );
 
+    -- title and body lengths match the maxLength of the web app's post form.
+    -- body is MEDIUMTEXT: 40,000 characters of utf8mb4 can be up to 160,000 bytes, more than TEXT's 65,535
+    CREATE TABLE post
+    (
+        id         BINARY(16)   NOT NULL,
+        user_id    BINARY(16)   NOT NULL,
+        role       VARCHAR(10)  NOT NULL,
+        title      VARCHAR(300) NOT NULL,
+        body       MEDIUMTEXT   NOT NULL,
+        created_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (id),
+        -- the lookup vindex only says which shards hold a user's posts, this finds them within each shard
+        KEY (user_id)
+    );
+
+    -- a post's cities: where a traveler is going, often a few near each other,
+    -- or for a local the one their profile was based in when they wrote it. so a city's posts are both its travelers' and its locals'.
+    -- sharded by post_id like post, so a post and its places are one shard's transaction
+    CREATE TABLE post_place
+    (
+        post_id BINARY(16)   NOT NULL,
+        country CHAR(2)      NOT NULL,
+        city    VARCHAR(100) NOT NULL,
+        -- no order kept, and a place is there once per post
+        PRIMARY KEY (post_id, country, city),
+        -- the posts of a city, newest first: innodb appends the primary key's post_id, and post ids are uuid v7, time ordered
+        KEY (country, city)
+    );
+
+    -- the post_user_id vindex's table: which shard (keyspace_id) each of a user's posts is on.
+    -- vtgate writes and deletes its rows along with post's, the app never touches it.
+    -- sharded by user_id, so looking up one user's posts reads one shard of it
+    CREATE TABLE post_user_id_lookup
+    (
+        user_id     BINARY(16)     NOT NULL,
+        keyspace_id VARBINARY(128) NOT NULL,
+        PRIMARY KEY (user_id, keyspace_id)
+    );
+
   vschema.json: |
     {
       "sharded": true,
       "vindexes": {
         "binary_md5": {
           "type": "binary_md5"
+        },
+        "post_user_id": {
+          "type": "consistent_lookup",
+          "params": {
+            "table": "holidayfriend.post_user_id_lookup",
+            "from": "user_id",
+            "to": "keyspace_id"
+          },
+          "owner": "post"
         }
       },
       "tables": {
@@ -43,9 +90,38 @@ data:
               "name": "binary_md5"
             }
           ]
+        },
+        "post": {
+          "column_vindexes": [
+            {
+              "column": "id",
+              "name": "binary_md5"
+            },
+            {
+              "column": "user_id",
+              "name": "post_user_id"
+            }
+          ]
+        },
+        "post_place": {
+          "column_vindexes": [
+            {
+              "column": "post_id",
+              "name": "binary_md5"
+            }
+          ]
+        },
+        "post_user_id_lookup": {
+          "column_vindexes": [
+            {
+              "column": "user_id",
+              "name": "binary_md5"
+            }
+          ]
         }
       }
     }
+
 ---
 apiVersion: batch/v1
 kind: Job
