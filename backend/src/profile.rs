@@ -5,7 +5,7 @@ use mysql_async::{Conn, Pool, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{location, place::Place, user::UserId};
+use crate::{cities, place::Place, user::UserId};
 
 const MAX_NAME: usize = 30;
 const MAX_PLACE: usize = 100;
@@ -70,7 +70,7 @@ impl SaveProfileRequest {
         )?;
         check(&self.based_in_city, MAX_PLACE, true, "Select your city")?;
         // the pair the web app's pickers offer, not just anything entered
-        if !location::is_city(self.based_in_country.trim(), self.based_in_city.trim()) {
+        if !cities::is_city(self.based_in_country.trim(), self.based_in_city.trim()) {
             return Err("Select your city from the list");
         }
         check(&self.about_me, MAX_ABOUT_ME, false, "About me is too long")?;
@@ -172,18 +172,19 @@ async fn upsert(
     .await
 }
 
+/// `MyProfileBrief` in the web app: what a screen needs of the person asking.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetBriefProfileResponse {
+pub struct MyProfileBriefResponse {
     name: String,
     based_in_country: String,
     based_in_city: String,
 }
 
-pub async fn get_brief(
+pub async fn get_my_brief(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
-) -> Result<Json<GetBriefProfileResponse>, (StatusCode, &'static str)> {
+) -> Result<Json<MyProfileBriefResponse>, (StatusCode, &'static str)> {
     let brief = select_brief(&pool, user_id).await.map_err(|err| {
         tracing::error!(error = %err, "fail to get profile brief");
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get profile")
@@ -197,7 +198,7 @@ pub async fn get_brief(
 async fn select_brief(
     pool: &Pool,
     user_id: Uuid,
-) -> mysql_async::Result<Option<GetBriefProfileResponse>> {
+) -> mysql_async::Result<Option<MyProfileBriefResponse>> {
     let mut conn = pool.get_conn().await?;
     let row: Option<(String, String, String)> = conn
         .exec_first(
@@ -212,7 +213,7 @@ async fn select_brief(
         .await?;
 
     Ok(row.map(
-        |(name, based_in_country, based_in_city)| GetBriefProfileResponse {
+        |(name, based_in_country, based_in_city)| MyProfileBriefResponse {
             name,
             based_in_country,
             based_in_city,
