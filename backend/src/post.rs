@@ -205,7 +205,7 @@ async fn insert(
     tx.commit().await
 }
 
-/// `GET /posts`: a city's posts, newest first, locals' and travelers' both. the web app's tabs filter them itself
+/// `GET /post/list`: a city's posts, newest first, locals' and travelers' both. the web app's tabs filter them itself
 #[derive(Debug, Deserialize)]
 pub struct ListPostsQuery {
     /// ISO 3166-1 alpha-2
@@ -213,7 +213,7 @@ pub struct ListPostsQuery {
     city: String,
     /// the last post id of the page before, the posts older than it come next. the first page leaves it out.
     /// a post id and not a page number, so posts written while scrolling don't shift the pages
-    before: Option<String>,
+    before: Option<Uuid>,
 }
 
 /// `PostFeedItem` in the web app.
@@ -243,13 +243,7 @@ pub async fn list(
     if !cities::is_city(country, city) {
         return Err((StatusCode::BAD_REQUEST, "The city is invalid"));
     }
-    let before = query
-        .before
-        .as_deref()
-        .map(Uuid::parse_str)
-        .transpose()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "The page is invalid"))?;
-    select_city_posts(&pool, country, city, before)
+    select_city_posts(&pool, country, city, query.before)
         .await
         .map(Json)
         .map_err(|err| {

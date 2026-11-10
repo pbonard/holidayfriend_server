@@ -1,4 +1,5 @@
 mod cities;
+mod invite;
 mod place;
 mod post;
 mod profile;
@@ -9,7 +10,7 @@ use std::env;
 use axum::{
     Router,
     extract::Request,
-    routing::{post, put},
+    routing::{get, post, put},
 };
 use mysql_async::{OptsBuilder, Pool};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -51,9 +52,15 @@ async fn main() {
     init_tracing();
 
     // the gateway sends everything under /api here and keeps the prefix in the path
-    let api = Router::new()
+    let api: Router<Pool> = Router::new()
         .route("/profile", put(profile::save).get(profile::get_my_brief))
-        .route("/posts", post(post::create).get(post::list));
+        .nest(
+            "/post",
+            Router::new()
+                .route("/", post(post::create))
+                .route("/list", get(post::list)),
+        )
+        .route("/invite", post(invite::send));
     let app = Router::new()
         .nest("/api", api)
         // one line per request, with what it was and how it went

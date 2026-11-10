@@ -25,7 +25,6 @@ data:
         -- how much of the based in shows on their posts: 'city' (and its country), 'country' or 'none'.
         -- one column so a city without its country can't be saved. profiles from before the choice show the city
         show_based_in     VARCHAR(10)  NOT NULL DEFAULT 'city',
-        updated_at        DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
         PRIMARY KEY (id)
     );
 
@@ -39,6 +38,7 @@ data:
         title      VARCHAR(300) NOT NULL,
         body       MEDIUMTEXT   NOT NULL,
         created_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        updated_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
         PRIMARY KEY (id),
         -- the lookup vindex only says which shards hold a user's posts, this finds them within each shard
         KEY (user_id)
@@ -66,6 +66,20 @@ data:
         user_id     BINARY(16)     NOT NULL,
         keyspace_id VARBINARY(128) NOT NULL,
         PRIMARY KEY (user_id, keyspace_id)
+    );
+
+    -- an invitation with a message from one person to another, found on a post or a profile. to the person and not the post,
+    -- so the post can be edited or deleted without it. one per pair of people while it waits for an answer.
+    -- sharded by to_user_id, so a person's requests are one shard and the primary key keeps a pair to one row
+    CREATE TABLE invitation
+    (
+        to_user_id   BINARY(16)   NOT NULL,
+        from_user_id BINARY(16)   NOT NULL,
+        message      VARCHAR(300) NOT NULL,
+        created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        PRIMARY KEY (to_user_id, from_user_id),
+        -- a person's requests, newest first
+        KEY (to_user_id, created_at)
     );
 
   vschema.json: |
@@ -118,6 +132,14 @@ data:
           "column_vindexes": [
             {
               "column": "user_id",
+              "name": "binary_md5"
+            }
+          ]
+        },
+        "invitation": {
+          "column_vindexes": [
+            {
+              "column": "to_user_id",
               "name": "binary_md5"
             }
           ]
