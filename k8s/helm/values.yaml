@@ -9,7 +9,7 @@ circuitBreaker:
 
 apps:
   server:
-    image: "holidayfriend/server:cc4ce22"
+    image: "holidayfriend/server:b206de5"
     port: 8080
     # longer than the / of web-route, so the gateway sends this path here instead of to the web app
     routePath: /api
