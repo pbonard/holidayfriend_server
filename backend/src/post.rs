@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    location,
+    cities,
     place::Place,
     profile::{self, AuthorBasedIn},
     user::UserId,
@@ -20,6 +20,10 @@ const MAX_BODY: usize = 40_000;
 const MAX_PLACES: usize = 10;
 // posts per page of a city's feed. a page shorter than this is the last one, the web app stops there
 const FEED_PAGE_SIZE: usize = 5;
+// the start of a post's body in the feed: more than a card's lines (the web app cuts it to them and adds …), the
+// whole body (up to MAX_BODY) is for the post's own page. characters and not bytes, so a multi-byte letter is never
+// cut in half
+const FEED_BODY_PREVIEW: usize = 650;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -99,7 +103,7 @@ fn validate_places(places: Vec<Place>) -> Result<Vec<Place>, &'static str> {
     for place in places {
         let country = place.country.trim();
         let city = place.city.trim();
-        if !location::is_city(country, city) {
+        if !cities::is_city(country, city) {
             return Err("A place is invalid");
         }
         let place = Place {
@@ -201,14 +205,12 @@ async fn insert(
     tx.commit().await
 }
 
-/// `GET /posts`: a city's posts, newest first.
+/// `GET /posts`: a city's posts, newest first, locals' and travelers' both. the web app's tabs filter them itself
 #[derive(Debug, Deserialize)]
 pub struct ListPostsQuery {
     /// ISO 3166-1 alpha-2
     country: String,
     city: String,
-    /// only locals' or only travelers' posts, both when left out
-    role: Option<PostRole>,
     /// the last post id of the page before, the posts older than it come next. the first page leaves it out.
     /// a post id and not a page number, so posts written while scrolling don't shift the pages
     before: Option<String>,
@@ -221,6 +223,7 @@ pub struct PostFeedItem {
     id: String,
     role: String,
     title: String,
+    /// the whole body, or its first FEED_BODY_PREVIEW characters when it's longer
     body: String,
     author_name: String,
     /// where the author's profile is based in, as much as they show: for the web app to tell a viewer
@@ -237,7 +240,7 @@ pub async fn list(
 ) -> Result<Json<Vec<PostFeedItem>>, (StatusCode, &'static str)> {
     let country = query.country.trim();
     let city = query.city.trim();
-    if !location::is_city(country, city) {
+    if !cities::is_city(country, city) {
         return Err((StatusCode::BAD_REQUEST, "The city is invalid"));
     }
     let before = query
@@ -246,7 +249,7 @@ pub async fn list(
         .map(Uuid::parse_str)
         .transpose()
         .map_err(|_| (StatusCode::BAD_REQUEST, "The page is invalid"))?;
-    select_city_posts(&pool, country, city, query.role, before)
+    select_city_posts(&pool, country, city, before)
         .await
         .map(Json)
         .map_err(|err| {
@@ -266,7 +269,6 @@ async fn select_city_posts(
     pool: &Pool,
     country: &str,
     city: &str,
-    role: Option<PostRole>,
     before: Option<Uuid>,
 ) -> mysql_async::Result<Vec<PostFeedItem>> {
     let mut conn = pool.get_conn().await?;
@@ -279,14 +281,13 @@ async fn select_city_posts(
         post.user_id,
         post.role,
         post.title,
-        post.body,
+        LEFT(post.body, {FEED_BODY_PREVIEW}),
         JSON_ARRAYAGG(JSON_OBJECT('country', place.country, 'city', place.city))
     FROM post_place AS here
     JOIN post ON post.id = here.post_id
     -- every city of the post, not only the one asked for
     JOIN post_place AS place ON place.post_id = post.id
     WHERE here.country = :country AND here.city = :city
-        AND (:role IS NULL OR post.role = :role)
         AND (:before IS NULL OR post.id < :before)
     GROUP BY post.id
     ORDER BY post.id DESC
@@ -295,7 +296,6 @@ async fn select_city_posts(
             params! {
                 "country" => country,
                 "city" => city,
-                "role" => role.map(PostRole::as_str),
                 "before" => before.map(|before| before.as_bytes().to_vec()),
             },
         )
