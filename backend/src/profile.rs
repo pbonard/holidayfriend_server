@@ -221,6 +221,22 @@ async fn select_brief(
     ))
 }
 
+/// Whether a person has set up their profile, which onboarding does before anything else
+pub async fn exists(conn: &mut Conn, user_id: Uuid) -> mysql_async::Result<bool> {
+    let row: Option<u8> = conn
+        .exec_first(
+            r"-- sql
+    SELECT 1
+    FROM profile
+    WHERE id = :user_id",
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Where a person is based in, to place a local's post in their city. what they show doesn't matter here:
 /// a local's post is in their city either way
 pub async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Result<Option<Place>> {
