@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     cities,
     place::Place,
-    profile::{self, AuthorBasedIn},
+    profile::{self, ProfileBasedIn},
     user::UserId,
 };
 
@@ -228,7 +228,7 @@ pub struct PostFeedItem {
     author_name: String,
     /// where the author's profile is based in, as much as they show: for the web app to tell a viewer
     /// from the same city or country. none when they show neither, or the profile is gone
-    author_based_in: Option<AuthorBasedIn>,
+    author_based_in: Option<ProfileBasedIn>,
     /// every city of the post, the one being explored too. a local's post has just theirs
     places: Vec<Place>,
 }
@@ -299,7 +299,7 @@ async fn select_city_posts(
     }
 
     // the authors' profiles are sharded by their own id, so they're read apart instead of joined
-    let authors = profile::select_authors(
+    let authors = profile::select_brief_profiles(
         &mut conn,
         posts.iter().map(|(_, user_id, ..)| user_id).collect(),
     )

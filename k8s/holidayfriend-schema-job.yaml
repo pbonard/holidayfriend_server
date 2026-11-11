@@ -68,18 +68,23 @@ data:
         PRIMARY KEY (user_id, keyspace_id)
     );
 
-    -- an invitation with a message from one person to another, found on a post or a profile. to the person and not the post,
-    -- so the post can be edited or deleted without it. one per pair of people while it waits for an answer.
+    -- an invite with a message from one person to another, found on a post or a profile. to the person and not the post,
+    -- so the post can be edited or deleted without it. one per pair of people: an answered one stays,
+    -- and is sent again in the same row once it's old enough, unless it was accepted.
     -- sharded by to_user_id, so a person's requests are one shard and the primary key keeps a pair to one row
-    CREATE TABLE invitation
+    CREATE TABLE invite
     (
+        -- uuid v7, new each time it's sent: the requests page by it, decline names it, and it holds when it was last sent.
+        -- not the primary key, the pair is: one row per pair is what stops a second invite
+        id           BINARY(16)   NOT NULL,
         to_user_id   BINARY(16)   NOT NULL,
         from_user_id BINARY(16)   NOT NULL,
         message      VARCHAR(300) NOT NULL,
-        created_at   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        -- 'pending', 'accepted' or 'declined'
+        status       VARCHAR(10)  NOT NULL DEFAULT 'pending',
         PRIMARY KEY (to_user_id, from_user_id),
-        -- a person's requests, newest first
-        KEY (to_user_id, created_at)
+        -- a person's requests by status, newest first: v7 ids are time ordered
+        KEY (to_user_id, status, id)
     );
 
   vschema.json: |
@@ -136,7 +141,7 @@ data:
             }
           ]
         },
-        "invitation": {
+        "invite": {
           "column_vindexes": [
             {
               "column": "to_user_id",

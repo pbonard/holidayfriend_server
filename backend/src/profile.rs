@@ -254,45 +254,39 @@ pub async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Res
     Ok(row.map(|(country, city)| Place { country, city }))
 }
 
-/// `AuthorBasedIn` in the web app.
 #[derive(Debug, Clone, Serialize)]
-pub struct AuthorBasedIn {
+pub struct ProfileBasedIn {
     country: String,
-    /// none when the author shows only their country
     city: Option<String>,
 }
 
-impl AuthorBasedIn {
+impl ProfileBasedIn {
     /// the columns select_authors leaves NULL for what an author hides: no country is nothing shown
     fn from_columns(country: Option<String>, city: Option<String>) -> Option<Self> {
-        country.map(|country| AuthorBasedIn { country, city })
+        country.map(|country| ProfileBasedIn { country, city })
     }
 }
 
-/// A post's author as anyone else sees them.
-pub struct Author {
+pub struct BriefProfile {
     pub name: String,
     /// as much as they show, none when they show neither
-    pub based_in: Option<AuthorBasedIn>,
+    pub based_in: Option<ProfileBasedIn>,
 }
 
 /// id, name, and the based in country and city, NULL for what's hidden
-type AuthorRow = (Vec<u8>, String, Option<String>, Option<String>);
+type BriefProfileRow = (Vec<u8>, String, Option<String>, Option<String>);
 
-/// The authors with these user ids, by id. only what each one shows leaves the database, the rest comes back
-/// NULL, and a show_based_in that's neither 'city' nor 'country' hides both.
-/// profiles are sharded by their id, so this IN of primary vindex values goes only to the shards that hold them
-pub async fn select_authors(
+pub async fn select_brief_profiles(
     conn: &mut Conn,
     mut user_ids: Vec<&Vec<u8>>,
-) -> mysql_async::Result<HashMap<Vec<u8>, Author>> {
+) -> mysql_async::Result<HashMap<Vec<u8>, BriefProfile>> {
     // one author of several posts is asked for once
     user_ids.sort();
     user_ids.dedup();
     if user_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows: Vec<AuthorRow> = conn
+    let rows: Vec<BriefProfileRow> = conn
         .exec(
             format!(
                 r"-- sql
@@ -311,8 +305,8 @@ pub async fn select_authors(
     Ok(rows
         .into_iter()
         .map(|(id, name, country, city)| {
-            let based_in = AuthorBasedIn::from_columns(country, city);
-            (id, Author { name, based_in })
+            let based_in = ProfileBasedIn::from_columns(country, city);
+            (id, BriefProfile { name, based_in })
         })
         .collect())
 }
@@ -324,7 +318,7 @@ mod tests {
     #[test]
     fn reads_a_shown_city_and_country() {
         let based_in =
-            AuthorBasedIn::from_columns(Some("KR".into()), Some("Seoul".into())).unwrap();
+            ProfileBasedIn::from_columns(Some("KR".into()), Some("Seoul".into())).unwrap();
         assert_eq!(
             (based_in.country.as_str(), based_in.city.as_deref()),
             ("KR", Some("Seoul"))
@@ -333,13 +327,13 @@ mod tests {
 
     #[test]
     fn reads_a_shown_country_alone() {
-        let based_in = AuthorBasedIn::from_columns(Some("KR".into()), None).unwrap();
+        let based_in = ProfileBasedIn::from_columns(Some("KR".into()), None).unwrap();
         assert_eq!((based_in.country.as_str(), based_in.city), ("KR", None));
     }
 
     #[test]
     fn reads_nothing_shown_as_none() {
-        assert!(AuthorBasedIn::from_columns(None, None).is_none());
+        assert!(ProfileBasedIn::from_columns(None, None).is_none());
     }
 
     fn valid() -> SaveProfileRequest {

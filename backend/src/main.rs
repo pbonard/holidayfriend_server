@@ -60,7 +60,13 @@ async fn main() {
                 .route("/", post(post::create))
                 .route("/list", get(post::list)),
         )
-        .route("/invite", post(invite::send));
+        .nest(
+            "/invite",
+            Router::new()
+                .route("/", post(invite::send))
+                .route("/list", get(invite::list))
+                .route("/{id}/decline", post(invite::decline)),
+        );
     let app = Router::new()
         .nest("/api", api)
         // one line per request, with what it was and how it went
