@@ -1,4 +1,4 @@
-# holidayfriend: auth and web, on their own keyspace, signing keys and google client (values-holidayfriend.yaml in the chart)
+# holidayfriend: auth, the chat services and web, on their own keyspace, signing keys and google client (values-holidayfriend.yaml in the chart)
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -30,3 +30,18 @@ data:
   K8SSANDRA_CA_CERT_PATH: "/cert/k8ssandra/ca.crt"
   MYSQL_URL: "vitess-cluster-zone1-vtgate-07109f85.vitess.svc.cluster.local:3306"
   MYSQL_DATABASE: "holidayfriend"
+  # auth consumes holidayfriend.auth, the chat services their holidayfriend.* topics, with the kafka-user and cluster
+  # ca the reflector copies here
+  KAFKA_ADDRESS: "kafka-cluster-kafka-bootstrap.kafka-system.svc.cluster.local:9093"
+  KAFKA_CA_CERT_PATH: "/cert/kafka/cluster/ca.crt"
+  KAFKA_USER_CERT_PATH: "/cert/kafka/user/user.crt"
+  KAFKA_USER_KEY_PATH: "/cert/kafka/user/user.key"
+  # chat, messagepreprocess and messagerelay: which pod holds a member's WebSocket, and the uploaded file names.
+  # the valkey-user and valkey-cert the reflector copies here
+  VALKEY_ADDRESS: "valkey-valkey-cluster.valkey-system.svc.cluster.local:6379"
+  VALKEY_HOST: "valkey-valkey-cluster.valkey-system.svc.cluster.local"
+  VALKEY_PORT: "6379"
+  VALKEY_USERNAME: "lule"
+  VALKEY_CA_CERT_PATH: "/cert/valkey/ca.crt"
+  # garage behind cloudflare, chat presigns upload and download urls for it. the bucket and keys are in garage-s3
+  S3_PUBLIC_URL: "https://s3.pbonard.com"
