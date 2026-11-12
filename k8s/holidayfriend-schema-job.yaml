@@ -87,6 +87,29 @@ data:
         KEY (to_user_id, status, id)
     );
 
+    -- events written in the transaction of the change they announce, like the ChatMessage of an accepted invite with
+    -- the invite's status, so the event goes out exactly when the change commits. the cdc-job of my-server streams
+    -- new rows to the kafka topic of the row. the app deletes each row in the transaction that inserts it, the cdc-job
+    -- reads the insert from the binlog and skips the delete, so the table stays empty. sharded by to_user_id like
+    -- invite, so the row and the invite it comes with are one shard's transaction
+    CREATE TABLE outbox
+    (
+        -- the id of the event, its kafka key: the invite id for an accepted invite's message
+        id         BINARY(16)  NOT NULL,
+        to_user_id BINARY(16)  NOT NULL,
+        -- the kind of event, the cdc-job picks the kafka topic from it: 'chat-message'
+        topic      VARCHAR(64) NOT NULL,
+        -- the taskType kafka header, none when null
+        task_type  VARCHAR(32) NULL,
+        -- the kafka value, the event's json
+        payload    TEXT        NOT NULL,
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        -- the id alone: vtgate routes by the vindex column to_user_id, not by the key, and a uuid v7 is unique by itself
+        PRIMARY KEY (id),
+        -- the rows left behind, if any ever are
+        KEY (created_at)
+    );
+
   vschema.json: |
     {
       "sharded": true,
@@ -142,6 +165,14 @@ data:
           ]
         },
         "invite": {
+          "column_vindexes": [
+            {
+              "column": "to_user_id",
+              "name": "binary_md5"
+            }
+          ]
+        },
+        "outbox": {
           "column_vindexes": [
             {
               "column": "to_user_id",

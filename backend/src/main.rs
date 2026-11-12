@@ -1,4 +1,5 @@
 mod cities;
+mod db;
 mod invite;
 mod place;
 mod post;
@@ -65,6 +66,7 @@ async fn main() {
             Router::new()
                 .route("/", post(invite::send))
                 .route("/list", get(invite::list))
+                .route("/{id}/accept", post(invite::accept))
                 .route("/{id}/decline", post(invite::decline)),
         );
     let app = Router::new()

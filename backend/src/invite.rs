@@ -1,27 +1,30 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use mysql_async::{Conn, Pool, params, prelude::Queryable};
+use mysql_async::{Pool, TxOpts};
 use serde::{Deserialize, Serialize};
 use uuid::{Builder, Uuid};
 
 use crate::{
-    profile::{self, ProfileBasedIn},
+    db::{
+        invite,
+        profile::{self, ProfileBasedIn},
+    },
     user::UserId,
 };
 
 const MAX_MESSAGE: usize = 300;
-// ER_DUP_ENTRY, vtgate passes the shard's error code through
-const DUPLICATE_ENTRY: u16 = 1062;
 const ALREADY_INVITED: &str = "You already sent this person an invite";
 // how old an invite has to be before it can be sent again, unless it was accepted
 const RESEND_AFTER_DAYS: u32 = 120;
 // invites per page of the requests screen. a page shorter than this is the last one, the web app stops there
 const LIST_PAGE_SIZE: usize = 20;
+// the topic of the ChatMessages of my-server's chat, the cdc-job sends to holidayfriend.chat-message
+const CHAT_MESSAGE_TOPIC: &str = "chat-message";
 
 /// An invite with a message, from a post or a profile. it's to the person, not the post: the post is only where they were found
 #[derive(Debug, Deserialize)]
@@ -73,56 +76,41 @@ pub async fn send(
         return Err((StatusCode::NOT_FOUND, "User not found"));
     }
 
+    // v7 is time ordered, so the requests are newest first by id
+    let id = Uuid::now_v7();
     // an old enough one is sent again in its place, it's one row per pair
-    if resend(&mut conn, from_user_id, &invite)
-        .await
-        .map_err(failed)?
+    if invite::resend(
+        &mut conn,
+        id,
+        resend_cutoff(now_millis()),
+        invite.to_user_id,
+        from_user_id,
+        &invite.message,
+    )
+    .await
+    .map_err(failed)?
     {
         return Ok(StatusCode::CREATED);
     }
-    match insert(&mut conn, from_user_id, &invite).await {
-        Ok(()) => Ok(StatusCode::CREATED),
-        // there's one already, accepted or too recent to send again
-        Err(mysql_async::Error::Server(err)) if err.code == DUPLICATE_ENTRY => {
-            Err((StatusCode::CONFLICT, ALREADY_INVITED))
-        }
-        Err(err) => Err(failed(err)),
+    if invite::insert(
+        &mut conn,
+        id,
+        invite.to_user_id,
+        from_user_id,
+        &invite.message,
+    )
+    .await
+    .map_err(failed)?
+    {
+        return Ok(StatusCode::CREATED);
     }
+    // there's one already, accepted or too recent to send again
+    Err((StatusCode::CONFLICT, ALREADY_INVITED))
 }
 
 fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
     tracing::error!(error = %err, "fail to invite");
     (StatusCode::INTERNAL_SERVER_ERROR, "Failed to invite")
-}
-
-/// Sends an earlier invite again with the new message, as if it were new: pending, with a new id so it's on top of
-/// the requests again and its age starts over. only one that isn't accepted and is at least RESEND_AFTER_DAYS old, whether it was declined
-/// or left unanswered. whether there was one, none when there's no invite or it can't be sent again yet.
-/// the age is checked in the same statement that changes it, so two sends at once can't both send it again:
-/// the second finds it sent just now
-async fn resend(
-    conn: &mut Conn,
-    from_user_id: Uuid,
-    invite: &CreateInviteRequest,
-) -> mysql_async::Result<bool> {
-    conn.exec_drop(
-        r"-- sql
-    UPDATE invite
-    SET id = :id, message = :message, status = 'pending'
-    WHERE to_user_id = :to_user_id AND from_user_id = :from_user_id
-        -- AND status <> 'accepted'
-        -- sent before the cutoff: a v7 id starts with when it was made, so ids compare as their times do
-        AND id < :cutoff",
-        params! {
-            "id" => Uuid::now_v7().as_bytes().to_vec(),
-            "cutoff" => resend_cutoff(now_millis()).as_bytes().to_vec(),
-            "to_user_id" => invite.to_user_id.as_bytes().to_vec(),
-            "from_user_id" => from_user_id.as_bytes().to_vec(),
-            "message" => invite.message.as_str(),
-        },
-    )
-    .await?;
-    Ok(conn.affected_rows() > 0)
 }
 
 fn now_millis() -> u64 {
@@ -138,27 +126,6 @@ fn resend_cutoff(now_millis: u64) -> Uuid {
     let resend_after_millis = u64::from(RESEND_AFTER_DAYS) * 24 * 60 * 60 * 1000;
     Builder::from_unix_timestamp_millis(now_millis.saturating_sub(resend_after_millis), &[0; 10])
         .into_uuid()
-}
-
-/// Sharded by to_user_id, so the primary key (to_user_id, from_user_id) keeps a pair to one invite within a shard
-async fn insert(
-    conn: &mut Conn,
-    from_user_id: Uuid,
-    invite: &CreateInviteRequest,
-) -> mysql_async::Result<()> {
-    conn.exec_drop(
-        r"-- sql
-    INSERT INTO invite (id, to_user_id, from_user_id, message)
-    VALUES (:id, :to_user_id, :from_user_id, :message)",
-        params! {
-            // v7 is time ordered, so the requests are newest first by id
-            "id" => Uuid::now_v7().as_bytes().to_vec(),
-            "to_user_id" => invite.to_user_id.as_bytes().to_vec(),
-            "from_user_id" => from_user_id.as_bytes().to_vec(),
-            "message" => invite.message.as_str(),
-        },
-    )
-    .await
 }
 
 /// `InviteListItem` in the web app: one invite sent to the person asking
@@ -183,78 +150,47 @@ pub struct ListInvitesQuery {
     before: Option<Uuid>,
 }
 
-/// `GET /invite/list`: the pending invites sent to the person asking, newest first, a page at a time
+/// `GET /invite/list`: the pending invites sent to the person asking, newest first, a page at a time.
+/// two round trips, the invites and then their senders, as profiles are on the shards of their own ids
 pub async fn list(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
     Query(query): Query<ListInvitesQuery>,
 ) -> Result<Json<Vec<InviteListItem>>, (StatusCode, &'static str)> {
-    select_received(&pool, user_id, query.before)
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to list invites");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load invites")
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let invites = invite::select_pending_received(&mut conn, user_id, query.before, LIST_PAGE_SIZE)
         .await
-        .map(Json)
-        .map_err(|err| {
-            tracing::error!(error = %err, "fail to list invites");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load invites")
-        })
-}
-
-/// id, from_user_id, message
-type InviteRow = (Vec<u8>, Vec<u8>, String);
-
-// two round trips are intended for vitess
-async fn select_received(
-    pool: &Pool,
-    user_id: Uuid,
-    before: Option<Uuid>,
-) -> mysql_async::Result<Vec<InviteListItem>> {
-    let mut conn = pool.get_conn().await?;
-    let invites: Vec<InviteRow> = conn
-        .exec(
-            format!(
-                r"-- sql
-    SELECT
-        id,
-        from_user_id,
-        message
-    FROM invite
-    WHERE to_user_id = :user_id AND status = 'pending'
-        AND (:before IS NULL OR id < :before)
-    ORDER BY id DESC
-    LIMIT {LIST_PAGE_SIZE}"
-            ),
-            params! {
-                "user_id" => user_id.as_bytes().to_vec(),
-                "before" => before.map(|before| before.as_bytes().to_vec()),
-            },
-        )
-        .await?;
+        .map_err(failed)?;
     if invites.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Json(Vec::new()));
     }
 
     let senders = profile::select_brief_profiles(
         &mut conn,
-        invites
-            .iter()
-            .map(|(_, from_user_id, ..)| from_user_id)
-            .collect(),
+        invites.iter().map(|invite| &invite.from_user_id).collect(),
     )
-    .await?;
+    .await
+    .map_err(failed)?;
 
-    Ok(invites
-        .into_iter()
-        .map(|(id, from_user_id, message)| {
-            let sender = senders.get(&from_user_id);
-            let id = Uuid::from_slice(&id).unwrap_or_default();
-            InviteListItem {
-                id,
-                from_user_id: Uuid::from_slice(&from_user_id).unwrap_or_default(),
-                from_name: sender.map(|sender| sender.name.clone()).unwrap_or_default(),
-                from_based_in: sender.and_then(|sender| sender.based_in.clone()),
-                message,
-            }
-        })
-        .collect())
+    Ok(Json(
+        invites
+            .into_iter()
+            .map(|invite| {
+                let sender = senders.get(&invite.from_user_id);
+                InviteListItem {
+                    id: invite.id,
+                    from_user_id: Uuid::from_slice(&invite.from_user_id).unwrap_or_default(),
+                    from_name: sender.map(|sender| sender.name.clone()).unwrap_or_default(),
+                    from_based_in: sender.and_then(|sender| sender.based_in.clone()),
+                    message: invite.message,
+                }
+            })
+            .collect(),
+    ))
 }
 
 /// `POST /invite/{id}/decline`: the person asking declines an invite sent to them.
@@ -264,15 +200,17 @@ pub async fn decline(
     State(pool): State<Pool>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, &'static str)> {
-    let declined = update_pending_to_declined(&pool, user_id, id)
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to decline invite");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to decline invite",
+        )
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let declined = invite::update_pending_to_declined(&mut conn, user_id, id)
         .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "fail to decline invite");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to decline invite",
-            )
-        })?;
+        .map_err(failed)?;
     if !declined {
         // none, not to them, already answered, or sent again since with a new id
         return Err((StatusCode::NOT_FOUND, "Invite not found"));
@@ -280,25 +218,75 @@ pub async fn decline(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Whether there was a pending invite to decline. to_user_id makes it one shard's write, and only the recipient's
-async fn update_pending_to_declined(
-    pool: &Pool,
-    to_user_id: Uuid,
+/// `POST /invite/{id}/accept`: the person asking accepts an invite sent to them, and its message becomes the first
+/// message of their chat with its sender. the chat gets it through the outbox in the transaction that accepts it,
+/// so it's sent exactly when the invite is accepted: not when accepting fails, and not twice when it's accepted again.
+/// the invite and its outbox row are on the shard of to_user_id, so it's one shard's transaction
+pub async fn accept(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to accept invite");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to accept invite")
+    };
+    // none, not to them, already answered, or sent again since with a new id
+    let not_found = (StatusCode::NOT_FOUND, "Invite not found");
+
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    // the update first: it locks the row, so what's read next is the invite this accepted
+    if !invite::update_pending_to_accepted(&mut tx, user_id, id)
+        .await
+        .map_err(failed)?
+    {
+        tx.rollback().await.map_err(failed)?;
+        return Err(not_found);
+    }
+    let Some((from_user_id, message)) = invite::select_sender_and_message(&mut tx, user_id, id)
+        .await
+        .map_err(failed)?
+    else {
+        tx.rollback().await.map_err(failed)?;
+        return Err(not_found);
+    };
+
+    // the invite's message as a message from its sender to the person who accepted it, in their personal chat.
+    // no push, the holidayfriend web app has none
+    let payload = serde_json::to_string(&ChatMessage {
+        id,
+        from_id: from_user_id,
+        to_id_type: "personal",
+        to_id: user_id,
+        content_type: "text",
+        contents: vec![message],
+        no_push: true,
+    })
+    // a struct of strings and bools always serializes
+    .unwrap_or_default();
+    // the invite id is the message's id too, it's the kafka key and the id the chat keeps it by
+    invite::outbox_publish(&mut tx, id, user_id, CHAT_MESSAGE_TOPIC, None, &payload)
+        .await
+        .map_err(failed)?;
+    tx.commit().await.map_err(failed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `ChatMessage` of my-server's backend/common/payload.go. the ids are uuid strings, as serde writes a Uuid
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessage {
     id: Uuid,
-) -> mysql_async::Result<bool> {
-    let mut conn = pool.get_conn().await?;
-    conn.exec_drop(
-        r"-- sql
-    UPDATE invite
-    SET status = 'declined'
-    WHERE to_user_id = :to_user_id AND id = :id AND status = 'pending'",
-        params! {
-            "to_user_id" => to_user_id.as_bytes().to_vec(),
-            "id" => id.as_bytes().to_vec(),
-        },
-    )
-    .await?;
-    Ok(conn.affected_rows() > 0)
+    from_id: Uuid,
+    to_id_type: &'static str,
+    to_id: Uuid,
+    content_type: &'static str,
+    contents: Vec<String>,
+    no_push: bool,
 }
 
 #[cfg(test)]
@@ -395,6 +383,32 @@ mod tests {
         // the smallest id of the cutoff's millisecond isn't
         assert!(Builder::from_unix_timestamp_millis(SENT_MILLIS, &[0; 10]).into_uuid() >= cutoff);
         assert!(id_at(SENT_MILLIS) > cutoff);
+    }
+
+    #[test]
+    fn writes_the_chat_message_as_go_reads_it() {
+        let payload = serde_json::to_value(ChatMessage {
+            id: Uuid::from_u128(3),
+            from_id: them(),
+            to_id_type: "personal",
+            to_id: me(),
+            content_type: "text",
+            contents: vec!["Hi".into()],
+            no_push: true,
+        })
+        .unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "id": "00000000-0000-0000-0000-000000000003",
+                "fromId": "00000000-0000-0000-0000-000000000002",
+                "toIdType": "personal",
+                "toId": "00000000-0000-0000-0000-000000000001",
+                "contentType": "text",
+                "contents": ["Hi"],
+                "noPush": true,
+            })
+        );
     }
 
     #[test]
