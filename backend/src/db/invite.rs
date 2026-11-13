@@ -5,9 +5,9 @@ use uuid::Uuid;
 const DUPLICATE_ENTRY: u16 = 1062;
 
 /// Sends an earlier invite again with the new message, as if it were new: pending, with the new id so it's on top
-/// of the requests again and its age starts over. only one that isn't accepted and was sent before the cutoff,
-/// whether it was declined or left unanswered. whether there was one, none when there's no invite or it can't be
-/// sent again yet. the age is checked in the same statement that changes it, so two sends at once can't both send
+/// of the requests again and its age starts over. only one sent before the cutoff, declined, left unanswered or
+/// accepted: an accepted one only gets here when the sender left their chat, which chat told send. whether there
+/// was one, none when there's no invite or it can't be sent again yet. the age is checked in the same statement that changes it, so two sends at once can't both send
 /// it again: the second finds it sent just now
 pub async fn resend(
     conn: &mut Conn,
@@ -22,7 +22,6 @@ pub async fn resend(
     UPDATE invite
     SET id = :id, message = :message, status = 'pending'
     WHERE to_user_id = :to_user_id AND from_user_id = :from_user_id
-        AND status <> 'accepted'
         -- sent before the cutoff: a v7 id starts with when it was made, so ids compare as their times do
         AND id < :cutoff",
         params! {

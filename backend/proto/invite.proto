@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+option go_package = "backend/common/proto";
+
+package inviteservice;
+
+// a copy of my-server's backend/common/proto/invite.proto, keep the two the same.
+// what chat knows about two people that decides whether an invite between them goes through
+service InviteService {
+  rpc CheckInvite(CheckInviteRequest) returns (CheckInviteResponse);
+}
+
+message CheckInviteRequest {
+  bytes fromId = 1;
+  bytes toId = 2;
+}
+
+message CheckInviteResponse {
+  // the invitee blocked the sender
+  bool blocked = 1;
+  // the sender's inbox still has messages with the invitee: they didn't leave the chat. only the sender's, so what
+  // the sender is told never shows whether the invitee left
+  bool senderHasChat = 2;
+}

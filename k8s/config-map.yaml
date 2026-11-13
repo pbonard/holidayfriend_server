@@ -30,6 +30,8 @@ data:
   K8SSANDRA_CA_CERT_PATH: "/cert/k8ssandra/ca.crt"
   MYSQL_URL: "vitess-cluster-zone1-vtgate-07109f85.vitess.svc.cluster.local:3306"
   MYSQL_DATABASE: "holidayfriend"
+  # holidayfriend-server asks chat whether an invite goes through, on chat's grpc port
+  CHAT_GRPC_URL: "http://chat.holidayfriend.svc.cluster.local:50051"
   # auth consumes holidayfriend.auth, the chat services their holidayfriend.* topics, with the kafka-user and cluster
   # ca the reflector copies here
   KAFKA_ADDRESS: "kafka-cluster-kafka-bootstrap.kafka-system.svc.cluster.local:9093"
