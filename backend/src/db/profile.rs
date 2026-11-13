@@ -176,11 +176,11 @@ pub async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Res
 /// id, name, and the based in country and city, NULL for what's hidden
 type BriefProfileRow = (Vec<u8>, String, Option<String>, Option<String>);
 
-/// The profiles of the people, by their id's bytes. one who's gone isn't there
+/// The profiles of the people, by their id. one who's gone isn't there
 pub async fn select_brief_profiles(
     conn: &mut Conn,
-    mut user_ids: Vec<&Vec<u8>>,
-) -> mysql_async::Result<HashMap<Vec<u8>, BriefProfile>> {
+    mut user_ids: Vec<Uuid>,
+) -> mysql_async::Result<HashMap<Uuid, BriefProfile>> {
     // one author of several posts is asked for once
     user_ids.sort();
     user_ids.dedup();
@@ -200,14 +200,21 @@ pub async fn select_brief_profiles(
     WHERE id IN ({})",
                 vec!["?"; user_ids.len()].join(", ")
             ),
-            user_ids,
+            user_ids
+                .iter()
+                .map(|id| id.as_bytes().to_vec())
+                .collect::<Vec<_>>(),
         )
         .await?;
     Ok(rows
         .into_iter()
         .map(|(id, name, country, city)| {
             let based_in = ProfileBasedIn::from_columns(country, city);
-            (id, BriefProfile { name, based_in })
+            // BINARY(16), so always the 16 bytes of a uuid
+            (
+                Uuid::from_slice(&id).unwrap_or_default(),
+                BriefProfile { name, based_in },
+            )
         })
         .collect())
 }

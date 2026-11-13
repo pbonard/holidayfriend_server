@@ -1,6 +1,7 @@
 use axum::{Json, extract::State, http::StatusCode};
 use mysql_async::Pool;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::{
     cities,
@@ -126,6 +127,8 @@ pub async fn save(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MyProfileBriefResponse {
+    /// the web app tells its own posts by it, e.g. no "Say hi" on them
+    id: Uuid,
     name: String,
     based_in_country: String,
     based_in_city: String,
@@ -148,6 +151,7 @@ pub async fn get_my_brief(
     brief
         .map(|brief| {
             Json(MyProfileBriefResponse {
+                id: user_id,
                 name: brief.name,
                 based_in_country: brief.based_in.country,
                 based_in_city: brief.based_in.city,

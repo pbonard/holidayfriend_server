@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use mysql_async::{Pool, TxOpts};
@@ -108,7 +108,7 @@ fn validate_places(places: Vec<Place>) -> Result<Vec<Place>, &'static str> {
 
 #[derive(Debug, Serialize)]
 pub struct CreatePostResponse {
-    id: String,
+    id: Uuid,
 }
 
 /// `POST /post`
@@ -143,9 +143,9 @@ pub async fn create(
         .map_err(failed)?;
     post::insert(
         &mut tx,
-        post_id,
-        user_id,
         &NewPost {
+            id: post_id,
+            user_id,
             role: valid.role,
             title: &valid.title,
             body: &valid.body,
@@ -160,9 +160,7 @@ pub async fn create(
 
     Ok((
         StatusCode::CREATED,
-        Json(CreatePostResponse {
-            id: post_id.to_string(),
-        }),
+        Json(CreatePostResponse { id: post_id }),
     ))
 }
 
@@ -186,11 +184,13 @@ pub struct ListPostsQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PostFeedItem {
-    id: String,
+    id: Uuid,
     role: String,
     title: String,
     /// the whole body, or its first FEED_BODY_PREVIEW characters when it's longer
     body: String,
+    /// who to send an invite to from the card
+    author_id: Uuid,
     author_name: String,
     /// where the author's profile is based in, as much as they show: for the web app to tell a viewer
     /// from the same city or country. none when they show neither, or the profile is gone
@@ -232,7 +232,7 @@ pub async fn list(
 
     // the authors' profiles are sharded by their own id, so they're read apart instead of joined
     let authors =
-        profile::select_brief_profiles(&mut conn, posts.iter().map(|post| &post.user_id).collect())
+        profile::select_brief_profiles(&mut conn, posts.iter().map(|post| post.user_id).collect())
             .await
             .map_err(failed)?;
 
@@ -242,10 +242,11 @@ pub async fn list(
             .map(|post| {
                 let author = authors.get(&post.user_id);
                 PostFeedItem {
-                    id: post.id.to_string(),
+                    id: post.id,
                     role: post.role,
                     title: post.title,
                     body: post.body,
+                    author_id: post.user_id,
                     author_name: author.map(|author| author.name.clone()).unwrap_or_default(),
                     author_based_in: author.and_then(|author| author.based_in.clone()),
                     places: post.places,
@@ -253,6 +254,55 @@ pub async fn list(
             })
             .collect(),
     ))
+}
+
+/// `PostDetail` in the web app.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostDetail {
+    id: Uuid,
+    role: String,
+    title: String,
+    /// the whole body
+    body: String,
+    /// who "Say hi" sends the invite to
+    author_id: Uuid,
+    author_name: String,
+    /// as much as the author shows, as in the feed
+    author_based_in: Option<ProfileBasedIn>,
+    places: Vec<Place>,
+}
+
+/// `GET /post/{id}`. two round trips, as the feed: the post with its cities, then its author
+pub async fn get(
+    _: UserId,
+    State(pool): State<Pool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PostDetail>, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to get post");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load the post")
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let post = post::select_post(&mut conn, id)
+        .await
+        .map_err(failed)?
+        .ok_or((StatusCode::NOT_FOUND, "Post not found"))?;
+    let authors = profile::select_brief_profiles(&mut conn, vec![post.user_id])
+        .await
+        .map_err(failed)?;
+    let author = authors.get(&post.user_id);
+
+    Ok(Json(PostDetail {
+        id: post.id,
+        role: post.role,
+        title: post.title,
+        body: post.body,
+        author_id: post.user_id,
+        author_name: author.map(|author| author.name.clone()).unwrap_or_default(),
+        author_based_in: author.and_then(|author| author.based_in.clone()),
+        places: post.places,
+    }))
 }
 
 #[cfg(test)]
@@ -398,6 +448,16 @@ mod tests {
             ..traveler()
         };
         assert!(request.validate().is_err());
+    }
+
+    // the web app reads ids as the hyphenated strings, uuid's serde writes them that way
+    #[test]
+    fn writes_ids_as_uuid_strings() {
+        let json = serde_json::to_string(&CreatePostResponse {
+            id: Uuid::from_u128(1),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"id":"00000000-0000-0000-0000-000000000001"}"#);
     }
 
     #[test]

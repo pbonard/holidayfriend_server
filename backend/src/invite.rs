@@ -210,7 +210,7 @@ pub async fn list(
 
     let senders = profile::select_brief_profiles(
         &mut conn,
-        invites.iter().map(|invite| &invite.from_user_id).collect(),
+        invites.iter().map(|invite| invite.from_user_id).collect(),
     )
     .await
     .map_err(failed)?;
@@ -222,7 +222,7 @@ pub async fn list(
                 let sender = senders.get(&invite.from_user_id);
                 InviteListItem {
                     id: invite.id,
-                    from_user_id: Uuid::from_slice(&invite.from_user_id).unwrap_or_default(),
+                    from_user_id: invite.from_user_id,
                     from_name: sender.map(|sender| sender.name.clone()).unwrap_or_default(),
                     from_based_in: sender.and_then(|sender| sender.based_in.clone()),
                     message: invite.message,

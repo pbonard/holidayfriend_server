@@ -20,8 +20,11 @@ impl PostRole {
     }
 }
 
-/// A post as it's saved, already checked and trimmed
+/// A post as it's saved, already checked and trimmed. every column by name, so the two ids or the title and body
+/// can't be swapped
 pub struct NewPost<'a> {
+    pub id: Uuid,
+    pub user_id: Uuid,
     pub role: PostRole,
     pub title: &'a str,
     pub body: &'a str,
@@ -29,19 +32,14 @@ pub struct NewPost<'a> {
 
 /// The post alone, insert_places adds its cities in the same transaction. both are sharded by the post's id,
 /// so it's one shard's transaction
-pub async fn insert(
-    tx: &mut Transaction<'_>,
-    post_id: Uuid,
-    user_id: Uuid,
-    post: &NewPost<'_>,
-) -> mysql_async::Result<()> {
+pub async fn insert(tx: &mut Transaction<'_>, post: &NewPost<'_>) -> mysql_async::Result<()> {
     tx.exec_drop(
         r"-- sql
     INSERT INTO post (id, user_id, role, title, body)
-    VALUES (:post_id, :user_id, :role, :title, :body)",
+    VALUES (:id, :user_id, :role, :title, :body)",
         params! {
-            "post_id" => post_id.as_bytes().to_vec(),
-            "user_id" => user_id.as_bytes().to_vec(),
+            "id" => post.id.as_bytes().to_vec(),
+            "user_id" => post.user_id.as_bytes().to_vec(),
             "role" => post.role.as_str(),
             "title" => post.title,
             "body" => post.body,
@@ -70,14 +68,14 @@ pub async fn insert_places(
     .await
 }
 
-/// A post of a city's feed
-pub struct CityPost {
+/// A post with every one of its cities
+pub struct PostWithPlaces {
     pub id: Uuid,
-    /// the bytes, as select_brief_profiles keys its authors
-    pub user_id: Vec<u8>,
+    /// the author
+    pub user_id: Uuid,
     pub role: String,
     pub title: String,
-    /// the whole body, or its first body_preview characters when it's longer
+    /// the whole body, or for a feed its first body_preview characters when it's longer
     pub body: String,
     /// every city of the post, the one asked for too
     pub places: Vec<Place>,
@@ -97,7 +95,7 @@ pub async fn select_city_posts(
     before: Option<Uuid>,
     limit: usize,
     body_preview: usize,
-) -> mysql_async::Result<Vec<CityPost>> {
+) -> mysql_async::Result<Vec<PostWithPlaces>> {
     let rows: Vec<PostRow> = conn
         .exec(
             format!(
@@ -126,18 +124,44 @@ pub async fn select_city_posts(
             },
         )
         .await?;
-    Ok(rows
-        .into_iter()
-        .map(|(id, user_id, role, title, body, places)| CityPost {
-            // BINARY(16), so always the 16 bytes of a uuid
-            id: Uuid::from_slice(&id).unwrap_or_default(),
-            user_id,
-            role,
-            title,
-            body,
-            places: parse_places(&places),
-        })
-        .collect())
+    Ok(rows.into_iter().map(post_with_places).collect())
+}
+
+/// The post of id with its whole body, none when there's none. both are sharded by the post's id, so it's one
+/// shard's query
+pub async fn select_post(conn: &mut Conn, id: Uuid) -> mysql_async::Result<Option<PostWithPlaces>> {
+    let row: Option<PostRow> = conn
+        .exec_first(
+            r"-- sql
+    SELECT
+        post.id,
+        post.user_id,
+        post.role,
+        post.title,
+        post.body,
+        JSON_ARRAYAGG(JSON_OBJECT('country', place.country, 'city', place.city))
+    FROM post
+    JOIN post_place AS place ON place.post_id = post.id
+    WHERE post.id = :id
+    GROUP BY post.id",
+            params! {
+                "id" => id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.map(post_with_places))
+}
+
+fn post_with_places((id, user_id, role, title, body, places): PostRow) -> PostWithPlaces {
+    PostWithPlaces {
+        // BINARY(16), so always the 16 bytes of a uuid
+        id: Uuid::from_slice(&id).unwrap_or_default(),
+        user_id: Uuid::from_slice(&user_id).unwrap_or_default(),
+        role,
+        title,
+        body,
+        places: parse_places(&places),
+    }
 }
 
 /// The json array JSON_ARRAYAGG built. mysql made it, so it's always this shape: a post shows

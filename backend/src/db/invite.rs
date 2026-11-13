@@ -68,8 +68,7 @@ pub async fn insert(
 /// A pending invite sent to the person
 pub struct ReceivedInvite {
     pub id: Uuid,
-    /// the bytes, as select_brief_profiles keys its senders
-    pub from_user_id: Vec<u8>,
+    pub from_user_id: Uuid,
     pub message: String,
 }
 
@@ -106,8 +105,9 @@ pub async fn select_pending_received(
     Ok(rows
         .into_iter()
         .map(|(id, from_user_id, message)| ReceivedInvite {
+            // BINARY(16), so always the 16 bytes of a uuid
             id: Uuid::from_slice(&id).unwrap_or_default(),
-            from_user_id,
+            from_user_id: Uuid::from_slice(&from_user_id).unwrap_or_default(),
             message,
         })
         .collect())

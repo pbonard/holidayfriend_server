@@ -80,7 +80,8 @@ async fn main() {
             "/post",
             Router::new()
                 .route("/", post(post::create))
-                .route("/list", get(post::list)),
+                .route("/list", get(post::list))
+                .route("/{id}", get(post::get)),
         )
         .nest(
             "/invite",
