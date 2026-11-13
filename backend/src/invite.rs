@@ -14,12 +14,14 @@ use crate::{
         invite,
         profile::{self, ProfileBasedIn},
     },
+    grpc_client::{GrpcClient, InviteCheck},
     user::UserId,
 };
 
 const MAX_MESSAGE: usize = 300;
 const ALREADY_INVITED: &str = "You already sent this person an invite";
-// how old an invite has to be before it can be sent again, unless it was accepted
+const ALREADY_CHATTING: &str = "You're already chatting with this person";
+// how old an invite has to be before it can be sent again
 const RESEND_AFTER_DAYS: u32 = 120;
 // invites per page of the requests screen. a page shorter than this is the last one, the web app stops there
 const LIST_PAGE_SIZE: usize = 20;
@@ -49,12 +51,37 @@ impl CreateInviteRequest {
     }
 }
 
+/// What sending an invite does, from what chat knows about the pair
+#[derive(Debug, PartialEq, Eq)]
+enum InviteDecision {
+    /// the invitee blocked the sender: nothing is sent, but the sender gets the answer of a sent one, as with
+    /// a message to who blocked them, so they can't tell
+    Hide,
+    /// the sender still has their chat: they write there, the message reaches the invitee even when the invitee left
+    AlreadyChatting,
+    Send,
+}
+
+/// A sender who still has the chat writes there instead, the invite is the way back for one who left it. only the
+/// sender's chat decides: the answer then never shows the sender whether the invitee left
+fn decide(check: InviteCheck) -> InviteDecision {
+    if check.blocked {
+        InviteDecision::Hide
+    } else if check.sender_has_chat {
+        InviteDecision::AlreadyChatting
+    } else {
+        InviteDecision::Send
+    }
+}
+
 /// `POST /invite`. one invite per pair of people: inviting the same person again is a conflict, unless the invite
-/// is at least RESEND_AFTER_DAYS old and wasn't accepted, declined or not. then it's sent again in its place.
+/// is at least RESEND_AFTER_DAYS old, accepted, declined or not. then it's sent again in its place. chat decides
+/// first: see decide.
 /// Errors are plain text, the web app's axios interceptor shows them as they are.
 pub async fn send(
     UserId(from_user_id): UserId,
     State(pool): State<Pool>,
+    State(grpc_client): State<GrpcClient>,
     Json(request): Json<CreateInviteRequest>,
 ) -> Result<StatusCode, (StatusCode, &'static str)> {
     let invite = request
@@ -74,6 +101,18 @@ pub async fn send(
         .map_err(failed)?
     {
         return Err((StatusCode::NOT_FOUND, "User not found"));
+    }
+    let check = grpc_client
+        .check_invite(from_user_id, invite.to_user_id)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = %err, "fail to check invite with chat");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to invite")
+        })?;
+    match decide(check) {
+        InviteDecision::Hide => return Ok(StatusCode::CREATED),
+        InviteDecision::AlreadyChatting => return Err((StatusCode::CONFLICT, ALREADY_CHATTING)),
+        InviteDecision::Send => {}
     }
 
     // v7 is time ordered, so the requests are newest first by id
@@ -104,7 +143,7 @@ pub async fn send(
     {
         return Ok(StatusCode::CREATED);
     }
-    // there's one already, accepted or too recent to send again
+    // there's one already, too recent to send again
     Err((StatusCode::CONFLICT, ALREADY_INVITED))
 }
 
@@ -306,6 +345,29 @@ mod tests {
             to_user_id: them(),
             message: "Hey! I'm visiting Tokyo next month".into(),
         }
+    }
+
+    fn check(blocked: bool, sender_has_chat: bool) -> InviteCheck {
+        InviteCheck {
+            blocked,
+            sender_has_chat,
+        }
+    }
+
+    #[test]
+    fn hides_an_invite_to_who_blocked_the_sender() {
+        assert_eq!(decide(check(true, false)), InviteDecision::Hide);
+        assert_eq!(decide(check(true, true)), InviteDecision::Hide);
+    }
+
+    #[test]
+    fn skips_an_invite_while_the_sender_has_the_chat() {
+        assert_eq!(decide(check(false, true)), InviteDecision::AlreadyChatting);
+    }
+
+    #[test]
+    fn sends_when_the_sender_left_the_chat() {
+        assert_eq!(decide(check(false, false)), InviteDecision::Send);
     }
 
     #[test]

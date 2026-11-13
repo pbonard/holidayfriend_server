@@ -1,18 +1,20 @@
 mod cities;
 mod db;
+mod grpc_client;
 mod invite;
 mod place;
 mod post;
 mod profile;
 mod user;
 
-use std::env;
+use std::{env, time::Duration};
 
 use axum::{
     Router,
-    extract::Request,
+    extract::{FromRef, Request},
     routing::{get, post, put},
 };
+use grpc_client::{GrpcClient, GrpcClientConfig};
 use mysql_async::{OptsBuilder, Pool};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -40,6 +42,25 @@ fn mysql_pool() -> Pool {
     )
 }
 
+/// What the handlers share: most only need the database, sending an invite asks chat too
+#[derive(Clone)]
+pub struct AppState {
+    pool: Pool,
+    grpc_client: GrpcClient,
+}
+
+impl FromRef<AppState> for Pool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
+    }
+}
+
+impl FromRef<AppState> for GrpcClient {
+    fn from_ref(state: &AppState) -> Self {
+        state.grpc_client.clone()
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -53,7 +74,7 @@ async fn main() {
     init_tracing();
 
     // the gateway sends everything under /api here and keeps the prefix in the path
-    let api: Router<Pool> = Router::new()
+    let api: Router<AppState> = Router::new()
         .route("/profile", put(profile::save).get(profile::get_my_brief))
         .nest(
             "/post",
@@ -91,7 +112,14 @@ async fn main() {
                 // tower-http logs these at debug, info makes them show with the default filter
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        .with_state(mysql_pool());
+        .with_state(AppState {
+            pool: mysql_pool(),
+            grpc_client: GrpcClient::connect_lazy(GrpcClientConfig {
+                // chat in this namespace, its grpc port: http://chat.holidayfriend.svc.cluster.local:50051
+                chat_url: required_env("CHAT_GRPC_URL"),
+                timeout: Duration::from_secs(3),
+            }),
+        });
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("listening on 0.0.0.0:8080");

@@ -6,10 +6,16 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust"] }
+prost = "0.14.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
+tonic = "0.14.9"
+tonic-prost = "0.14.9"
 tower-http = { version = "0.7.1", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.29.0", features = ["v7", "serde"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14.9"
