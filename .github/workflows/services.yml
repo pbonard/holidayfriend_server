@@ -44,6 +44,10 @@ jobs:
       - name: checkout github
         uses: actions/checkout@v6
 
+      # build.rs compiles the proto of chat's grpc client with protoc, the Dockerfile installs it for the image
+      - name: install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       # the image build only compiles, it doesn't run the tests
       - name: test
         working-directory: ${{ matrix.service.context }}
