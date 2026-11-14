@@ -256,6 +256,64 @@ pub async fn list(
     ))
 }
 
+/// `GET /post/user/{user_id}`: the next page of a person's posts
+#[derive(Debug, Deserialize)]
+pub struct ListUserPostsQuery {
+    /// the last post id of the page before, as in the city's feed. the first page leaves it out
+    before: Option<Uuid>,
+}
+
+/// `UserPostItem` in the web app: a post as a line of its author's profile. no author: the profile above the list
+/// is theirs, so a lookup of them for every page would only repeat what the page already has
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserPostItem {
+    id: Uuid,
+    role: String,
+    title: String,
+    /// the whole body, or its first FEED_BODY_PREVIEW characters when it's longer
+    body: String,
+    /// every city of the post, the first is the one its page opens from
+    places: Vec<Place>,
+}
+
+/// `GET /post/user/{user_id}`: a person's posts for their profile page, newest first and a page at a time as a
+/// city's feed. one round trip: the posts with their cities
+pub async fn list_by_user(
+    _: UserId,
+    State(pool): State<Pool>,
+    Path(user_id): Path<Uuid>,
+    Query(query): Query<ListUserPostsQuery>,
+) -> Result<Json<Vec<UserPostItem>>, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to list user posts");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load posts")
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let posts = post::select_user_posts(
+        &mut conn,
+        user_id,
+        query.before,
+        FEED_PAGE_SIZE,
+        FEED_BODY_PREVIEW,
+    )
+    .await
+    .map_err(failed)?;
+
+    Ok(Json(
+        posts
+            .into_iter()
+            .map(|post| UserPostItem {
+                id: post.id,
+                role: post.role,
+                title: post.title,
+                body: post.body,
+                places: post.places,
+            })
+            .collect(),
+    ))
+}
+
 /// `PostDetail` in the web app.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

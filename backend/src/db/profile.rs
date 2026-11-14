@@ -173,6 +173,97 @@ pub async fn select_based_in(conn: &mut Conn, user_id: Uuid) -> mysql_async::Res
     Ok(row.map(|(country, city)| Place { country, city }))
 }
 
+/// What anyone sees of a person's profile on its own page: all of it but what of the based in they hide
+pub struct PublicProfile {
+    pub name: String,
+    /// as much as they show, none when they show neither
+    pub based_in: Option<ProfileBasedIn>,
+    pub about_me: String,
+    pub grew_up_in: String,
+    pub languages: String,
+    pub dream_destination: String,
+    pub obsession: String,
+    pub local_spot: String,
+    pub best_trip: String,
+    pub birth_decade: String,
+    pub fun_fact: String,
+}
+
+/// name, the based in country and city (NULL for what's hidden), then about me and the eight prompts
+type PublicProfileRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
+/// A person's profile as anyone sees it, none when they have none. the same CASEs as select_brief_profiles, so a
+/// hidden city or country never leaves the database
+pub async fn select_public_profile(
+    conn: &mut Conn,
+    user_id: Uuid,
+) -> mysql_async::Result<Option<PublicProfile>> {
+    let row: Option<PublicProfileRow> = conn
+        .exec_first(
+            r"-- sql
+    SELECT
+        name,
+        CASE WHEN show_based_in IN ('city', 'country') THEN based_in_country END,
+        CASE WHEN show_based_in = 'city' THEN based_in_city END,
+        about_me,
+        grew_up_in,
+        languages,
+        dream_destination,
+        obsession,
+        local_spot,
+        best_trip,
+        birth_decade,
+        fun_fact
+    FROM profile
+    WHERE id = :user_id",
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.map(
+        |(
+            name,
+            country,
+            city,
+            about_me,
+            grew_up_in,
+            languages,
+            dream_destination,
+            obsession,
+            local_spot,
+            best_trip,
+            birth_decade,
+            fun_fact,
+        )| PublicProfile {
+            name,
+            based_in: ProfileBasedIn::from_columns(country, city),
+            about_me,
+            grew_up_in,
+            languages,
+            dream_destination,
+            obsession,
+            local_spot,
+            best_trip,
+            birth_decade,
+            fun_fact,
+        },
+    ))
+}
+
 /// id, name, and the based in country and city, NULL for what's hidden
 type BriefProfileRow = (Vec<u8>, String, Option<String>, Option<String>);
 

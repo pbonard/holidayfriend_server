@@ -127,6 +127,45 @@ pub async fn select_city_posts(
     Ok(rows.into_iter().map(post_with_places).collect())
 }
 
+/// A person's posts, newest first, `limit` of them older than `before`, each with every one of its cities.
+/// the post_user_id lookup vindex sends it only to the shards that hold their posts, and KEY (user_id) (with the
+/// primary key innodb appends to it) finds them there in id order. vtgate merges the shards by id, the newest first
+/// since post ids are uuid v7
+pub async fn select_user_posts(
+    conn: &mut Conn,
+    user_id: Uuid,
+    before: Option<Uuid>,
+    limit: usize,
+    body_preview: usize,
+) -> mysql_async::Result<Vec<PostWithPlaces>> {
+    let rows: Vec<PostRow> = conn
+        .exec(
+            format!(
+                r"-- sql
+    SELECT
+        post.id,
+        post.user_id,
+        post.role,
+        post.title,
+        LEFT(post.body, {body_preview}),
+        JSON_ARRAYAGG(JSON_OBJECT('country', place.country, 'city', place.city))
+    FROM post
+    JOIN post_place AS place ON place.post_id = post.id
+    WHERE post.user_id = :user_id
+        AND (:before IS NULL OR post.id < :before)
+    GROUP BY post.id
+    ORDER BY post.id DESC
+    LIMIT {limit}"
+            ),
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+                "before" => before.map(|before| before.as_bytes().to_vec()),
+            },
+        )
+        .await?;
+    Ok(rows.into_iter().map(post_with_places).collect())
+}
+
 /// The post of id with its whole body, none when there's none. both are sharded by the post's id, so it's one
 /// shard's query
 pub async fn select_post(conn: &mut Conn, id: Uuid) -> mysql_async::Result<Option<PostWithPlaces>> {

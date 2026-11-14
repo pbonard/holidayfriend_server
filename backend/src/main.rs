@@ -75,12 +75,15 @@ async fn main() {
 
     // the gateway sends everything under /api here and keeps the prefix in the path
     let api: Router<AppState> = Router::new()
-        .route("/profile", put(profile::save).get(profile::get_my_brief))
+        .route("/profile", put(profile::save))
+        .route("/profile/brief/my", get(profile::get_my_brief))
+        .route("/profile/{id}", get(profile::get))
         .nest(
             "/post",
             Router::new()
                 .route("/", post(post::create))
                 .route("/list", get(post::list))
+                .route("/user/{user_id}", get(post::list_by_user))
                 .route("/{id}", get(post::get)),
         )
         .nest(
