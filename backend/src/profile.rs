@@ -1,11 +1,15 @@
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use mysql_async::Pool;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     cities,
-    db::profile::{self, Profile, ShowBasedIn},
+    db::profile::{self, Profile, ProfileBasedIn, ShowBasedIn},
     user::UserId,
 };
 
@@ -134,7 +138,7 @@ pub struct MyProfileBriefResponse {
     based_in_city: String,
 }
 
-/// `GET /profile`
+/// `GET /profile/brief/my`
 pub async fn get_my_brief(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
@@ -158,6 +162,58 @@ pub async fn get_my_brief(
             })
         })
         .ok_or((StatusCode::NOT_FOUND, "Profile not found"))
+}
+
+/// `Profile` in the web app: a person's profile page, as anyone sees it
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileResponse {
+    /// who "Say hi" sends the invite to, and whose posts the page lists
+    id: Uuid,
+    name: String,
+    /// as much as they show, none when they show neither
+    based_in: Option<ProfileBasedIn>,
+    about_me: String,
+    grew_up_in: String,
+    languages: String,
+    dream_destination: String,
+    obsession: String,
+    local_spot: String,
+    best_trip: String,
+    birth_decade: String,
+    fun_fact: String,
+}
+
+/// `GET /profile/{id}`. the person's own page shows only what they show others too
+pub async fn get(
+    _: UserId,
+    State(pool): State<Pool>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ProfileResponse>, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to get profile");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get profile")
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let profile = profile::select_public_profile(&mut conn, id)
+        .await
+        .map_err(failed)?
+        .ok_or((StatusCode::NOT_FOUND, "Profile not found"))?;
+
+    Ok(Json(ProfileResponse {
+        id,
+        name: profile.name,
+        based_in: profile.based_in,
+        about_me: profile.about_me,
+        grew_up_in: profile.grew_up_in,
+        languages: profile.languages,
+        dream_destination: profile.dream_destination,
+        obsession: profile.obsession,
+        local_spot: profile.local_spot,
+        best_trip: profile.best_trip,
+        birth_decade: profile.birth_decade,
+        fun_fact: profile.fun_fact,
+    }))
 }
 
 #[cfg(test)]
