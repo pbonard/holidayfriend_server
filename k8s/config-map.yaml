@@ -45,5 +45,7 @@ data:
   VALKEY_PORT: "6379"
   VALKEY_USERNAME: "lule"
   VALKEY_CA_CERT_PATH: "/cert/valkey/ca.crt"
-  # garage behind cloudflare, chat presigns upload and download urls for it. the bucket and keys are in garage-s3
+  # garage straight from the home ip, not through cloudflare (its free plan sends korean users through los angeles,
+  # where media crawled): chat presigns upload and download urls for it. the bucket and keys are in garage-s3.
+  # s3.pbonard.com's direct path is in my-infra (terraform/cloudflare.tf, k8s/bootstrap/gateway.yaml)
   S3_PUBLIC_URL: "https://s3.pbonard.com"
