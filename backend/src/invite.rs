@@ -294,23 +294,34 @@ pub async fn accept(
         return Err(not_found);
     };
 
-    // the invite's message as a message from its sender to the person who accepted it, in their personal chat.
-    // no push, the holidayfriend web app has none
+    // the invite's message as the chat's first, from its sender to the person who accepted it. "accept" and not
+    // "text", so the web app can show it as the invite it was, with contents [message] as a text's. shown as sent when
+    // it was accepted: an id of now and not the invite's, as chat hands out the messages newer than a client's cursor,
+    // so with the invite's (from when it was sent) a sender whose cursor passed it since would never get it. the
+    // transaction already sends it once, the id needn't. no push, the holidayfriend web app has none
+    let message_id = Uuid::now_v7();
     let payload = serde_json::to_string(&ChatMessage {
-        id,
+        id: message_id,
         from_id: from_user_id,
         to_id_type: "personal",
         to_id: user_id,
-        content_type: "text",
+        content_type: "accept",
         contents: vec![message],
         no_push: true,
     })
     // a struct of strings and bools always serializes
     .unwrap_or_default();
-    // the invite id is the message's id too, it's the kafka key and the id the chat keeps it by
-    invite::outbox_publish(&mut tx, id, user_id, CHAT_MESSAGE_TOPIC, None, &payload)
-        .await
-        .map_err(failed)?;
+    // the message's id is the outbox row's, the kafka key and the id the chat keeps it by
+    invite::outbox_publish(
+        &mut tx,
+        message_id,
+        user_id,
+        CHAT_MESSAGE_TOPIC,
+        None,
+        &payload,
+    )
+    .await
+    .map_err(failed)?;
     tx.commit().await.map_err(failed)?;
     Ok(StatusCode::NO_CONTENT)
 }
