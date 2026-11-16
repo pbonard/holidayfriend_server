@@ -52,6 +52,9 @@ metadata:
   name: {{ $name }}-circuit-breaker
   namespace: {{ $.Values.namespace }}
 spec:
+  # merged with the gateway's per-ip rate limit (my-infra k8s/bootstrap/rate-limit.yaml). without it this policy wins
+  # over the gateway's and the limit never reaches this route
+  mergeType: StrategicMerge
   targetRef:
     group: gateway.networking.k8s.io
     kind: HTTPRoute
