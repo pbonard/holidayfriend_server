@@ -52,12 +52,14 @@ pub struct ModerationClient {
 }
 
 impl ModerationClient {
-    /// Reads the policy and its categories from the env, so they change with a restart, not a new image. none of
-    /// them has a default: a server without them stops at startup
+    /// Reads ollama, its timeout, the policy and its categories from the env (k8s/config-map.yaml), so they change
+    /// with a restart, not a new image. none of them has a default: a server without them stops at startup
     pub fn from_env() -> Self {
         let url = required_env("OLLAMA_URL");
         let model = required_env("OLLAMA_MODEL");
-        // k8s/config-map.yaml
+        let timeout_seconds: u64 = required_env("OLLAMA_TIMEOUT_SECONDS")
+            .parse()
+            .expect("OLLAMA_TIMEOUT_SECONDS must be a number of seconds");
         let mut categories: Vec<String> = required_env("MODERATION_CATEGORIES")
             .split(',')
             .map(str::trim)
@@ -72,7 +74,7 @@ impl ModerationClient {
         Self {
             http: reqwest::Client::builder()
                 // a timeout is an error, the report goes to the retryer
-                .timeout(Duration::from_secs(60))
+                .timeout(Duration::from_secs(timeout_seconds))
                 .build()
                 .expect("fail to build the ollama http client"),
             url: format!("{url}/api/chat"),

@@ -81,7 +81,9 @@ impl FromRef<AppState> for ModerationClient {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // confluent-kafka logs every fetch at info under fetch_diag, twice a second even when there's nothing
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,fetch_diag=warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .json()
