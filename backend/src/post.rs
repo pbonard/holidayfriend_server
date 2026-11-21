@@ -162,6 +162,109 @@ fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
     (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create post")
 }
 
+/// `UpdatePostRequest` in the web app: the post to change, and all of it again as the create form sends it
+#[derive(Debug, Deserialize)]
+pub struct UpdatePostRequest {
+    id: Uuid,
+    #[serde(flatten)]
+    post: CreatePostRequest,
+}
+
+/// `PUT /post`: the author changes their post, any of it but who wrote it, checked as a new one is. a traveler's
+/// cities are replaced by the ones sent. a post that becomes local drops the cities its author picked for the one
+/// their profile is based in, as a new local post has. a local post that stays local keeps the city it was written
+/// in, as it does when the author moves. the post and its places are on the post's shard, so it's one shard's
+/// transaction
+pub async fn update(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+    Json(request): Json<UpdatePostRequest>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to update post");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to update the post",
+        )
+    };
+    let id = request.id;
+    let mut valid = request
+        .post
+        .validate()
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    // a local's city is the one their profile is based in, as in create. read before the transaction: the profile is
+    // on its own shard, and whether the post was local already is only known inside it
+    if valid.role == PostRole::Local {
+        let based_in = profile::select_based_in(&mut conn, user_id)
+            .await
+            .map_err(failed)?
+            .ok_or((StatusCode::BAD_REQUEST, "Set up your profile first"))?;
+        valid.places = vec![based_in];
+    }
+    // a failed check returns before commit, and dropping the transaction rolls it back
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    let (author_id, old_role) = post::select_author_for_update(&mut tx, id)
+        .await
+        .map_err(failed)?
+        .ok_or((StatusCode::NOT_FOUND, "Post not found"))?;
+    if author_id != user_id {
+        return Err((StatusCode::FORBIDDEN, "You can only edit your own post"));
+    }
+    post::update(&mut tx, id, valid.role, &valid.title, &valid.body)
+        .await
+        .map_err(failed)?;
+    // a local post that stays local keeps the city it was written in
+    if old_role != PostRole::Local || valid.role != PostRole::Local {
+        // only what changed: the cities it no longer has go, the new ones come
+        post::delete_places_except(&mut tx, id, &valid.places)
+            .await
+            .map_err(failed)?;
+        post::insert_missing_places(&mut tx, id, &valid.places)
+            .await
+            .map_err(failed)?;
+    }
+    tx.commit().await.map_err(failed)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /post?id=`: the author deletes their post for good, its cities with it, in one transaction on the
+/// post's shard. invites found on it stay, they're to the person and not the post. the post_not_interested rows
+/// naming it stay too: they're on the shards of the people who hid it, and an id that's gone hides nothing
+pub async fn delete(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+    Query(IdStruct { id }): Query<IdStruct>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to delete post");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to delete the post",
+        )
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    // the author check is the delete's own WHERE, so there's nothing to read first
+    let deleted = post::delete(&mut tx, id, user_id).await.map_err(failed)?;
+    if !deleted {
+        // none, or someone else's: the same answer, the post stays either way. dropping the transaction rolls it back
+        return Err((StatusCode::NOT_FOUND, "Post not found"));
+    }
+    post::delete_places(&mut tx, id).await.map_err(failed)?;
+    tx.commit().await.map_err(failed)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /post/list`: a city's posts, newest first, locals' and travelers' both. the web app's tabs filter them itself
 #[derive(Debug, Deserialize)]
 pub struct ListPostsQuery {
@@ -555,5 +658,17 @@ mod tests {
         let request: CreatePostRequest =
             serde_json::from_str(r#"{"role":"local","title":"t","body":"b"}"#).unwrap();
         assert!(request.places.is_empty());
+    }
+
+    // the web app sends the id beside the create form's fields, not around them
+    #[test]
+    fn reads_an_update_as_the_id_and_the_create_fields() {
+        let request: UpdatePostRequest = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000001","role":"traveler",
+                "places":[{"country":"JP","city":"Tokyo"}],"title":"t","body":"b"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.id, Uuid::from_u128(1));
+        assert_eq!(request.post.validate().unwrap().places, vec![tokyo()]);
     }
 }

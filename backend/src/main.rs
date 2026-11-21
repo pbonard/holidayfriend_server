@@ -80,7 +80,13 @@ async fn main() {
         .nest(
             "/post",
             Router::new()
-                .route("/", get(post::get).post(post::create))
+                .route(
+                    "/",
+                    get(post::get)
+                        .post(post::create)
+                        .put(post::update)
+                        .delete(post::delete),
+                )
                 .route("/list", get(post::list))
                 .route("/user", get(post::list_by_user))
                 .route(
