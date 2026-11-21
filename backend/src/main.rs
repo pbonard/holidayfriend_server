@@ -3,6 +3,8 @@ mod db;
 mod grpc_client;
 mod id;
 mod invite;
+mod kafka;
+mod moderation_client;
 mod place;
 mod post;
 mod profile;
@@ -15,6 +17,8 @@ use axum::{
     routing::{get, post},
 };
 use grpc_client::{GrpcClient, GrpcClientConfig};
+use kafka::producer::Producer;
+use moderation_client::ModerationClient;
 use mysql_async::{OptsBuilder, Pool};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
@@ -42,11 +46,14 @@ fn mysql_pool() -> Pool {
     )
 }
 
-/// What the handlers share: most only need the database, sending an invite asks chat too
+/// What the handlers share: most only need the database, sending an invite asks chat too, reporting a post kafka.
+/// the report consumer gets it too, as a handler would
 #[derive(Clone)]
 pub struct AppState {
     pool: Pool,
     grpc_client: GrpcClient,
+    producer: Producer,
+    moderation: ModerationClient,
 }
 
 impl FromRef<AppState> for Pool {
@@ -61,6 +68,18 @@ impl FromRef<AppState> for GrpcClient {
     }
 }
 
+impl FromRef<AppState> for Producer {
+    fn from_ref(state: &AppState) -> Self {
+        state.producer.clone()
+    }
+}
+
+impl FromRef<AppState> for ModerationClient {
+    fn from_ref(state: &AppState) -> Self {
+        state.moderation.clone()
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -72,6 +91,27 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() {
     init_tracing();
+
+    let state = AppState {
+        pool: mysql_pool(),
+        grpc_client: GrpcClient::connect_lazy(GrpcClientConfig {
+            // chat in this namespace, its grpc port: http://chat.holidayfriend.svc.cluster.local:50051
+            chat_url: required_env("CHAT_GRPC_URL"),
+            timeout: Duration::from_secs(3),
+        }),
+        producer: kafka::producer::new("holidayfriend-server"),
+        moderation: ModerationClient::from_env(),
+    };
+
+    // in this process, as onlineconversation's consumer is in its server: the reports are few, and it shares the
+    // state with the handlers, the producer hands a failed report to the retry job
+    let consumer = tokio::spawn(kafka::consumer::consume(state.clone()));
+    // it only returns by panicking, and the server shouldn't go on without it: the pod restarts instead
+    tokio::spawn(async move {
+        let err = consumer.await.err();
+        tracing::error!(error = ?err, "report consumer stopped");
+        std::process::exit(1);
+    });
 
     // the gateway sends everything under /api here and keeps the prefix in the path
     let api: Router<AppState> = Router::new()
@@ -89,6 +129,7 @@ async fn main() {
                 )
                 .route("/list", get(post::list))
                 .route("/user", get(post::list_by_user))
+                .route("/report", post(post::report))
                 .route(
                     "/not-interested",
                     get(post::list_not_interested).post(post::not_interested),
@@ -124,14 +165,7 @@ async fn main() {
                 // tower-http logs these at debug, info makes them show with the default filter
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        .with_state(AppState {
-            pool: mysql_pool(),
-            grpc_client: GrpcClient::connect_lazy(GrpcClientConfig {
-                // chat in this namespace, its grpc port: http://chat.holidayfriend.svc.cluster.local:50051
-                chat_url: required_env("CHAT_GRPC_URL"),
-                timeout: Duration::from_secs(3),
-            }),
-        });
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("listening on 0.0.0.0:8080");

@@ -38,6 +38,10 @@ data:
   KAFKA_CA_CERT_PATH: "/cert/kafka/cluster/ca.crt"
   KAFKA_USER_CERT_PATH: "/cert/kafka/user/user.crt"
   KAFKA_USER_KEY_PATH: "/cert/kafka/user/user.key"
+  # holidayfriend-server asks it whether a reported post breaks the policy. without MODERATION_POLICY and
+  # MODERATION_CATEGORIES the server's default ones are used (backend/src/moderation_client.rs)
+  OLLAMA_URL: "http://ollama.llm.svc.cluster.local:11434"
+  OLLAMA_MODEL: "qwen3:8b"
   # chat, messagepreprocess and messagerelay: which pod holds a member's WebSocket, and the uploaded file names.
   # the valkey-user and valkey-cert the reflector copies here
   VALKEY_ADDRESS: "valkey-valkey-cluster.valkey-system.svc.cluster.local:6379"

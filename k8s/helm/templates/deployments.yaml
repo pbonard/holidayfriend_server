@@ -41,6 +41,26 @@ spec:
             - secretRef:
                 name: mysql
             {{- end }}
+          {{- if $app.kafka }}
+          # KAFKA_USER_CERT_PATH, KAFKA_USER_KEY_PATH and KAFKA_CA_CERT_PATH of the config map
+          volumeMounts:
+            - name: kafka-user
+              mountPath: "/cert/kafka/user"
+              readOnly: true
+            - name: kafka-ca
+              mountPath: "/cert/kafka/cluster"
+              readOnly: true
+          {{- end }}
+      {{- if $app.kafka }}
+      # the reflector copies both here from kafka-system (my-infra k8s/bootstrap/kafka-user.yaml)
+      volumes:
+        - name: kafka-user
+          secret:
+            secretName: kafka-user
+        - name: kafka-ca
+          secret:
+            secretName: kafka-cluster-cluster-ca-cert
+      {{- end }}
 ---
 apiVersion: v1
 kind: Service
