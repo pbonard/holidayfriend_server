@@ -1,18 +1,18 @@
 mod cities;
 mod db;
 mod grpc_client;
+mod id;
 mod invite;
 mod place;
 mod post;
 mod profile;
-mod user;
 
 use std::{env, time::Duration};
 
 use axum::{
     Router,
     extract::{FromRef, Request},
-    routing::{get, post, put},
+    routing::{get, post},
 };
 use grpc_client::{GrpcClient, GrpcClientConfig};
 use mysql_async::{OptsBuilder, Pool};
@@ -75,24 +75,26 @@ async fn main() {
 
     // the gateway sends everything under /api here and keeps the prefix in the path
     let api: Router<AppState> = Router::new()
-        .route("/profile", put(profile::save))
+        .route("/profile", get(profile::get).put(profile::save))
         .route("/profile/brief/my", get(profile::get_my_brief))
-        .route("/profile/{id}", get(profile::get))
         .nest(
             "/post",
             Router::new()
-                .route("/", post(post::create))
+                .route("/", get(post::get).post(post::create))
                 .route("/list", get(post::list))
-                .route("/user/{user_id}", get(post::list_by_user))
-                .route("/{id}", get(post::get)),
+                .route("/user", get(post::list_by_user))
+                .route(
+                    "/not-interested",
+                    get(post::list_not_interested).post(post::not_interested),
+                ),
         )
         .nest(
             "/invite",
             Router::new()
                 .route("/", post(invite::send))
                 .route("/list", get(invite::list))
-                .route("/{id}/accept", post(invite::accept))
-                .route("/{id}/decline", post(invite::decline)),
+                .route("/accept", post(invite::accept))
+                .route("/decline", post(invite::decline)),
         );
     let app = Router::new()
         .nest("/api", api)

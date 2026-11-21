@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::StatusCode,
 };
 use mysql_async::{Pool, TxOpts};
@@ -15,7 +15,7 @@ use crate::{
         profile::{self, ProfileBasedIn},
     },
     grpc_client::{GrpcClient, InviteCheck},
-    user::UserId,
+    id::{IdStruct, UserId},
 };
 
 const MAX_MESSAGE: usize = 300;
@@ -232,12 +232,12 @@ pub async fn list(
     ))
 }
 
-/// `POST /invite/{id}/decline`: the person asking declines an invite sent to them.
+/// `POST /invite/decline`: the person asking declines an invite sent to them.
 /// it stays, declined, so its sender can't send another until it's old enough
 pub async fn decline(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
-    Path(id): Path<Uuid>,
+    Json(IdStruct { id }): Json<IdStruct>,
 ) -> Result<StatusCode, (StatusCode, &'static str)> {
     let failed = |err: mysql_async::Error| {
         tracing::error!(error = %err, "fail to decline invite");
@@ -257,14 +257,14 @@ pub async fn decline(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /invite/{id}/accept`: the person asking accepts an invite sent to them, and its message becomes the first
+/// `POST /invite/accept`: the person asking accepts an invite sent to them, and its message becomes the first
 /// message of their chat with its sender. the chat gets it through the outbox in the transaction that accepts it,
 /// so it's sent exactly when the invite is accepted: not when accepting fails, and not twice when it's accepted again.
 /// the invite and its outbox row are on the shard of to_user_id, so it's one shard's transaction
 pub async fn accept(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
-    Path(id): Path<Uuid>,
+    Json(IdStruct { id }): Json<IdStruct>,
 ) -> Result<StatusCode, (StatusCode, &'static str)> {
     let failed = |err: mysql_async::Error| {
         tracing::error!(error = %err, "fail to accept invite");

@@ -68,6 +68,16 @@ data:
         PRIMARY KEY (user_id, keyspace_id)
     );
 
+    -- the posts a person marked "Not interested" from a post card's more button, so the feed hides them from them.
+    -- sharded by user_id, so a person's hidden posts are one shard's read when the feed leaves them out
+    CREATE TABLE post_not_interested
+    (
+        user_id BINARY(16) NOT NULL,
+        post_id BINARY(16) NOT NULL,
+        -- a post is hidden once per person
+        PRIMARY KEY (user_id, post_id)
+    );
+
     -- an invite with a message from one person to another, found on a post or a profile. to the person and not the post,
     -- so the post can be edited or deleted without it. one per pair of people: an answered one stays,
     -- and is sent again in the same row once it's old enough, unless it was accepted.
@@ -157,6 +167,14 @@ data:
           ]
         },
         "post_user_id_lookup": {
+          "column_vindexes": [
+            {
+              "column": "user_id",
+              "name": "binary_md5"
+            }
+          ]
+        },
+        "post_not_interested": {
           "column_vindexes": [
             {
               "column": "user_id",

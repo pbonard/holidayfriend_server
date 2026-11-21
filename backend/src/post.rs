@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::StatusCode,
 };
 use mysql_async::{Pool, TxOpts};
@@ -11,10 +11,11 @@ use crate::{
     cities,
     db::{
         post::{self, NewPost, PostRole},
+        post_not_interested,
         profile::{self, ProfileBasedIn},
     },
+    id::{IdStruct, UserId},
     place::Place,
-    user::UserId,
 };
 
 // reddit's limits, the same as the maxLength of the web app's post form
@@ -106,18 +107,13 @@ fn validate_places(places: Vec<Place>) -> Result<Vec<Place>, &'static str> {
     Ok(valid)
 }
 
-#[derive(Debug, Serialize)]
-pub struct CreatePostResponse {
-    id: Uuid,
-}
-
 /// `POST /post`
 /// Errors are plain text, the web app's axios interceptor shows them as they are.
 pub async fn create(
     UserId(user_id): UserId,
     State(pool): State<Pool>,
     Json(request): Json<CreatePostRequest>,
-) -> Result<(StatusCode, Json<CreatePostResponse>), (StatusCode, &'static str)> {
+) -> Result<(StatusCode, Json<IdStruct>), (StatusCode, &'static str)> {
     let mut valid = request
         .validate()
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
@@ -158,10 +154,7 @@ pub async fn create(
         .map_err(failed)?;
     tx.commit().await.map_err(failed)?;
 
-    Ok((
-        StatusCode::CREATED,
-        Json(CreatePostResponse { id: post_id }),
-    ))
+    Ok((StatusCode::CREATED, Json(IdStruct { id: post_id })))
 }
 
 fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
@@ -256,9 +249,11 @@ pub async fn list(
     ))
 }
 
-/// `GET /post/user/{user_id}`: the next page of a person's posts
+/// `GET /post/user?userId=`: whose posts, and the next page of them
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListUserPostsQuery {
+    user_id: Uuid,
     /// the last post id of the page before, as in the city's feed. the first page leaves it out
     before: Option<Uuid>,
 }
@@ -277,12 +272,11 @@ pub struct UserPostItem {
     places: Vec<Place>,
 }
 
-/// `GET /post/user/{user_id}`: a person's posts for their profile page, newest first and a page at a time as a
+/// `GET /post/user?userId=`: a person's posts for their profile page, newest first and a page at a time as a
 /// city's feed. one round trip: the posts with their cities
 pub async fn list_by_user(
     _: UserId,
     State(pool): State<Pool>,
-    Path(user_id): Path<Uuid>,
     Query(query): Query<ListUserPostsQuery>,
 ) -> Result<Json<Vec<UserPostItem>>, (StatusCode, &'static str)> {
     let failed = |err: mysql_async::Error| {
@@ -292,7 +286,7 @@ pub async fn list_by_user(
     let mut conn = pool.get_conn().await.map_err(failed)?;
     let posts = post::select_user_posts(
         &mut conn,
-        user_id,
+        query.user_id,
         query.before,
         FEED_PAGE_SIZE,
         FEED_BODY_PREVIEW,
@@ -331,11 +325,11 @@ pub struct PostDetail {
     places: Vec<Place>,
 }
 
-/// `GET /post/{id}`. two round trips, as the feed: the post with its cities, then its author
+/// `GET /post?id=`. two round trips, as the feed: the post with its cities, then its author
 pub async fn get(
     _: UserId,
     State(pool): State<Pool>,
-    Path(id): Path<Uuid>,
+    Query(IdStruct { id }): Query<IdStruct>,
 ) -> Result<Json<PostDetail>, (StatusCode, &'static str)> {
     let failed = |err: mysql_async::Error| {
         tracing::error!(error = %err, "fail to get post");
@@ -361,6 +355,44 @@ pub async fn get(
         author_based_in: author.and_then(|author| author.based_in.clone()),
         places: post.places,
     }))
+}
+
+/// `POST /post/not-interested`: the person asking hides the post from their feed, from the more button of its
+/// card. no check that the post exists: a missing one hides nothing, and checking would read the post's shard too
+pub async fn not_interested(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+    Json(IdStruct { id }): Json<IdStruct>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to mark post not interested");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to hide the post")
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    post_not_interested::insert(&mut conn, user_id, id)
+        .await
+        .map_err(failed)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /post/not-interested`: the ids of every post the person asking hid, for the web app to leave out of the
+/// feeds. apart from `GET /post/list`, so a city's feed stays the same for everyone
+pub async fn list_not_interested(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+) -> Result<Json<Vec<Uuid>>, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to list not interested posts");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to load hidden posts",
+        )
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let post_ids = post_not_interested::select_post_ids(&mut conn, user_id)
+        .await
+        .map_err(failed)?;
+    Ok(Json(post_ids))
 }
 
 #[cfg(test)]
@@ -511,7 +543,7 @@ mod tests {
     // the web app reads ids as the hyphenated strings, uuid's serde writes them that way
     #[test]
     fn writes_ids_as_uuid_strings() {
-        let json = serde_json::to_string(&CreatePostResponse {
+        let json = serde_json::to_string(&IdStruct {
             id: Uuid::from_u128(1),
         })
         .unwrap();
