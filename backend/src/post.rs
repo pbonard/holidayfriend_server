@@ -11,10 +11,14 @@ use crate::{
     cities,
     db::{
         post::{self, NewPost, PostRole},
-        post_not_interested,
         profile::{self, ProfileBasedIn},
     },
     id::{IdStruct, UserId},
+    kafka::{
+        self,
+        producer::{self, Producer},
+    },
+    moderation_client::ModerationClient,
     place::Place,
 };
 
@@ -472,7 +476,7 @@ pub async fn not_interested(
         (StatusCode::INTERNAL_SERVER_ERROR, "Failed to hide the post")
     };
     let mut conn = pool.get_conn().await.map_err(failed)?;
-    post_not_interested::insert(&mut conn, user_id, id)
+    post::insert_not_interested(&mut conn, user_id, id)
         .await
         .map_err(failed)?;
     Ok(StatusCode::NO_CONTENT)
@@ -492,10 +496,118 @@ pub async fn list_not_interested(
         )
     };
     let mut conn = pool.get_conn().await.map_err(failed)?;
-    let post_ids = post_not_interested::select_post_ids(&mut conn, user_id)
+    let post_ids = post::select_not_interested_post_ids(&mut conn, user_id)
         .await
         .map_err(failed)?;
     Ok(Json(post_ids))
+}
+
+/// `POST /post/report`: the person asking reports someone's post, from the more button of its card or its page.
+/// answered once the broker has it. no check that the post exists or who wrote it: the consumer reads the post,
+/// a missing one is dropped there (kafka/consumer.rs)
+pub async fn report(
+    UserId(user_id): UserId,
+    State(producer): State<Producer>,
+    Json(IdStruct { id }): Json<IdStruct>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    producer::send(
+        &producer,
+        kafka::TOPIC,
+        id.as_bytes(),
+        None,
+        vec![(
+            kafka::TASK_TYPE_HEADER.to_string(),
+            kafka::REPORT_POST_TASK.as_bytes().to_vec(),
+        )],
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, post_id = %id, "fail to report post");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to report the post",
+        )
+    })?;
+    tracing::info!(post_id = %id, reporter_id = %user_id, "post reported");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A reported post, the report consumer's REPORT_POST_TASK, as howwasread-server's onlineconversation evaluates a
+/// reported conversation. asks the model about the post and saves what it said. a violation deletes the post, its
+/// cities with it; a post that's fine is marked so the next report of it is skipped, until it's edited. the model's
+/// call is outside the transaction, it takes seconds: the post is checked to be unchanged when it's written down
+/// instead. an error is why it failed, the report goes to the retry job with it
+pub async fn manage_report(
+    pool: &Pool,
+    moderation_client: &ModerationClient,
+    post_id: Uuid,
+) -> Result<(), String> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, post_id = %post_id, "fail to evaluate reported post");
+        err.to_string()
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let Some(target) = post::select_report_target(&mut conn, post_id)
+        .await
+        .map_err(failed)?
+    else {
+        // deleted by its author, or by an earlier report
+        return Ok(());
+    };
+    if target.is_evaluated {
+        return Ok(());
+    }
+
+    let verdict = moderation_client
+        .evaluate(&target.title, &target.body)
+        .await?;
+
+    // a failed step returns before commit, and dropping the transaction rolls it back
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    let marked = post::mark_evaluated_if_unchanged(&mut tx, post_id, &target.updated_at)
+        .await
+        .map_err(failed)?;
+    if !marked {
+        tracing::info!(
+            post_id = %post_id,
+            violation = verdict.violation,
+            "post changed during report evaluation"
+        );
+        if !verdict.violation {
+            return Err(
+                "post contents was okay, but contents changed during report evaluation".into(),
+            );
+        }
+        // so when it "was" a violation, the post is deleted even when it was edited while the model read it
+    }
+    post::insert_verdict(
+        &mut tx,
+        post_id,
+        &target,
+        moderation_client.model(),
+        &verdict,
+    )
+    .await
+    .map_err(failed)?;
+    if verdict.violation {
+        tracing::info!(
+            post_id = %post_id,
+            category = verdict.category,
+            "delete violating post"
+        );
+        // by its author, as they would delete it. none when they deleted it meanwhile, its cities go either way
+        post::delete(&mut tx, post_id, target.user_id)
+            .await
+            .map_err(failed)?;
+        post::delete_places(&mut tx, post_id)
+            .await
+            .map_err(failed)?;
+    }
+    tx.commit().await.map_err(failed)?;
+    Ok(())
 }
 
 #[cfg(test)]

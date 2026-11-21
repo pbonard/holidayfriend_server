@@ -1,8 +1,12 @@
 use mysql_async::{Conn, Params, Transaction, Value, params, prelude::Queryable};
 use serde::Deserialize;
+use serde_json::json;
 use uuid::Uuid;
 
-use crate::place::Place;
+use crate::{moderation_client::Verdict, place::Place};
+
+// ER_DUP_ENTRY, vtgate passes the shard's error code through
+const DUPLICATE_ENTRY: u16 = 1062;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,7 +105,7 @@ pub async fn select_author_for_update(
 }
 
 /// The post's own columns, already checked and trimmed. never user_id: a post stays its author's, and the
-/// post_user_id vindex is by it
+/// post_user_id vindex is by it. the words may be new, so a report evaluates them again
 pub async fn update(
     tx: &mut Transaction<'_>,
     id: Uuid,
@@ -112,7 +116,7 @@ pub async fn update(
     tx.exec_drop(
         r"-- sql
     UPDATE post
-    SET role = :role, title = :title, body = :body
+    SET role = :role, title = :title, body = :body, is_evaluated = FALSE
     WHERE id = :id",
         params! {
             "id" => id.as_bytes().to_vec(),
@@ -222,6 +226,144 @@ pub async fn delete(
     )
     .await?;
     Ok(tx.affected_rows() > 0)
+}
+
+/// What a report evaluates: the words, and when they were last changed, to tell an edit made while the model was
+/// reading them
+pub struct ReportTarget {
+    /// the author, whose delete it is when it's a violation
+    pub user_id: Uuid,
+    pub title: String,
+    pub body: String,
+    /// DATETIME(6) as the server sent it, compared and saved again as is
+    pub updated_at: Value,
+    /// it was evaluated already and was fine, and hasn't been edited since
+    pub is_evaluated: bool,
+}
+
+/// The post a report is about, none when it's gone. one shard's read
+pub async fn select_report_target(
+    conn: &mut Conn,
+    id: Uuid,
+) -> mysql_async::Result<Option<ReportTarget>> {
+    let row: Option<(Vec<u8>, String, String, Value, bool)> = conn
+        .exec_first(
+            r"-- sql
+    SELECT user_id, title, body, updated_at, is_evaluated
+    FROM post
+    WHERE id = :id",
+            params! {
+                "id" => id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.map(
+        |(user_id, title, body, updated_at, is_evaluated)| ReportTarget {
+            // BINARY(16), so always the 16 bytes of a uuid
+            user_id: Uuid::from_slice(&user_id).unwrap_or_default(),
+            title,
+            body,
+            updated_at,
+            is_evaluated,
+        },
+    ))
+}
+
+/// Marks the post evaluated, only when it wasn't edited since `updated_at`. whether it was. updated_at is set to
+/// itself, or ON UPDATE would make the mark look like an edit
+pub async fn mark_evaluated_if_unchanged(
+    tx: &mut Transaction<'_>,
+    id: Uuid,
+    updated_at: &Value,
+) -> mysql_async::Result<bool> {
+    tx.exec_drop(
+        r"-- sql
+    UPDATE post
+    SET is_evaluated = TRUE, updated_at = updated_at
+    WHERE id = :id AND updated_at = :updated_at",
+        params! {
+            "id" => id.as_bytes().to_vec(),
+            "updated_at" => updated_at.clone(),
+        },
+    )
+    .await?;
+    Ok(tx.affected_rows() > 0)
+}
+
+/// What the model said about a reported post, with the words it read, so a deleted post's reason stays. sharded by
+/// post_id like post, so it's one shard's transaction with marking or deleting the post
+pub async fn insert_verdict(
+    tx: &mut Transaction<'_>,
+    post_id: Uuid,
+    target: &ReportTarget,
+    model: &str,
+    verdict: &Verdict,
+) -> mysql_async::Result<()> {
+    let contents = json!({ "title": target.title, "body": target.body }).to_string();
+    let updated_at: Value = target.updated_at.clone();
+    tx.exec_drop(
+        r"-- sql
+    INSERT INTO post_verdict
+    (post_id, content_updated_at, contents, model, violation, category, reason)
+    VALUES (:post_id, :content_updated_at, :contents, :model, :violation, :category, :reason)",
+        params! {
+            "post_id" => post_id.as_bytes().to_vec(),
+            "content_updated_at" => updated_at,
+            contents,
+            model,
+            "violation" => verdict.violation,
+            "category" => &verdict.category,
+            "reason" => &verdict.reason,
+        },
+    )
+    .await
+}
+
+/// Hides the post from the person. marking it again is a no-op, so a retried
+/// request or a second tap succeeds too. sharded by user_id, so it's one shard's write
+pub async fn insert_not_interested(
+    conn: &mut Conn,
+    user_id: Uuid,
+    post_id: Uuid,
+) -> mysql_async::Result<()> {
+    let inserted = conn
+        .exec_drop(
+            r"-- sql
+    INSERT INTO post_not_interested (user_id, post_id)
+    VALUES (:user_id, :post_id)",
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+                "post_id" => post_id.as_bytes().to_vec(),
+            },
+        )
+        .await;
+    match inserted {
+        Err(mysql_async::Error::Server(err)) if err.code == DUPLICATE_ENTRY => Ok(()),
+        result => result,
+    }
+}
+
+/// Every post the person hid. the primary key starts with user_id, so it's one shard's read of one range
+pub async fn select_not_interested_post_ids(
+    conn: &mut Conn,
+    user_id: Uuid,
+) -> mysql_async::Result<Vec<Uuid>> {
+    let rows: Vec<Vec<u8>> = conn
+        .exec(
+            r"-- sql
+    SELECT post_id
+    FROM post_not_interested
+    WHERE user_id = :user_id",
+            params! {
+                "user_id" => user_id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        // BINARY(16), so always the 16 bytes of a uuid
+        .map(|post_id| Uuid::from_slice(&post_id).unwrap_or_default())
+        .collect())
 }
 
 /// A post with every one of its cities

@@ -15,5 +15,7 @@ apps:
     routePath: /api
     # MYSQL_USERNAME and MYSQL_PASSWORD
     mysql: true
+    # the kafka-user and cluster ca certs: post reports go through the holidayfriend topic
+    kafka: true
     memoryRequests: "64Mi"
     memoryLimits: "128Mi"

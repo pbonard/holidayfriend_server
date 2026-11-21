@@ -2,5 +2,4 @@
 //! writes together, and returns what it read: the service decides what's one transaction
 pub mod invite;
 pub mod post;
-pub mod post_not_interested;
 pub mod profile;

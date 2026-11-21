@@ -39,9 +39,28 @@ data:
         body       MEDIUMTEXT   NOT NULL,
         created_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
         updated_at DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+        -- a report found it fine, so the next report of it is skipped. an edit sets it back to FALSE
+        is_evaluated BOOLEAN    NOT NULL DEFAULT FALSE,
         PRIMARY KEY (id),
         -- the lookup vindex only says which shards hold a user's posts, this finds them within each shard
         KEY (user_id)
+    );
+
+    -- what the model said about a reported post, with the words it read: a violating post is deleted, its verdict stays.
+    -- sharded by post_id like post, so a verdict and marking or deleting its post are one shard's transaction
+    CREATE TABLE post_verdict
+    (
+        post_id            BINARY(16)  NOT NULL,
+        created_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        -- updated_at of the evaluated post
+        content_updated_at DATETIME(6) NOT NULL,
+        -- {"title", "body"}
+        contents           JSON        NOT NULL,
+        model              VARCHAR(64) NOT NULL,
+        violation          BOOLEAN     NOT NULL,
+        category           VARCHAR(32) NOT NULL,
+        reason             TEXT        NOT NULL,
+        PRIMARY KEY (post_id, created_at)
     );
 
     -- a post's cities: where a traveler is going, often a few near each other,
@@ -159,6 +178,14 @@ data:
           ]
         },
         "post_place": {
+          "column_vindexes": [
+            {
+              "column": "post_id",
+              "name": "binary_md5"
+            }
+          ]
+        },
+        "post_verdict": {
           "column_vindexes": [
             {
               "column": "post_id",
