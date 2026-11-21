@@ -536,7 +536,8 @@ pub async fn report(
 /// reported conversation. asks the model about the post and saves what it said. a violation deletes the post, its
 /// cities with it; a post that's fine is marked so the next report of it is skipped, until it's edited. the model's
 /// call is outside the transaction, it takes seconds: the post is checked to be unchanged when it's written down
-/// instead. an error is why it failed, the report goes to the retry job with it
+/// instead. an error is why it failed, the report goes to the retry job with it. a rebalance or shutdown can drop
+/// it at any await (kafka/consumer.rs), so what it writes stays in the one transaction
 pub async fn manage_report(
     pool: &Pool,
     moderation_client: &ModerationClient,

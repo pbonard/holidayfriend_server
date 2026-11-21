@@ -20,6 +20,8 @@ use grpc_client::{GrpcClient, GrpcClientConfig};
 use kafka::producer::Producer;
 use moderation_client::ModerationClient;
 use mysql_async::{OptsBuilder, Pool};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
@@ -105,15 +107,26 @@ async fn main() {
         moderation: ModerationClient::from_env(),
     };
 
+    // SIGTERM from kubernetes or ctrl-c: the server stops taking requests and finishes its own, the consumer leaves
+    // its group
+    let shutdown = CancellationToken::new();
+    tokio::spawn(cancel_on_signal(shutdown.clone()));
+
     // in this process, as onlineconversation's consumer is in its server: the reports are few, and it shares the
     // state with the handlers, the producer hands a failed report to the retry job
-    let consumer = tokio::spawn(kafka::consumer::consume(state.clone()));
-    // it only returns by panicking, and the server shouldn't go on without it: the pod restarts instead
-    tokio::spawn(async move {
-        let err = consumer.await.err();
-        tracing::error!(error = ?err, "report consumer stopped");
-        std::process::exit(1);
-    });
+    let consumer = tokio::spawn(kafka::consumer::consume(state.clone(), shutdown.clone()));
+    // it returns only at shutdown. before it, it panicked, and the server shouldn't go on without it: the pod
+    // restarts instead
+    let consumer = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let result = consumer.await;
+            if result.is_err() || !shutdown.is_cancelled() {
+                tracing::error!(error = ?result.err(), "report consumer stopped");
+                std::process::exit(1);
+            }
+        })
+    };
 
     // the gateway sends everything under /api here and keeps the prefix in the path
     let api: Router<AppState> = Router::new()
@@ -171,5 +184,20 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     tracing::info!("listening on 0.0.0.0:8080");
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await
+        .unwrap();
+    // waits for the consumer to leave its group and commit what its workers finished
+    let _ = consumer.await;
+}
+
+async fn cancel_on_signal(shutdown: CancellationToken) {
+    let mut terminate = signal(SignalKind::terminate()).expect("fail to listen for SIGTERM");
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+    tracing::info!("shutting down");
+    shutdown.cancel();
 }
