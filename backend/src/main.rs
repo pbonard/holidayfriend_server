@@ -19,7 +19,7 @@ use axum::{
 use grpc_client::{GrpcClient, GrpcClientConfig};
 use kafka::producer::Producer;
 use moderation_client::ModerationClient;
-use mysql_async::{OptsBuilder, Pool};
+use mysql_async::Pool;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
@@ -28,24 +28,6 @@ use tracing_subscriber::EnvFilter;
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
-}
-
-fn mysql_pool() -> Pool {
-    // host:port, the same format as MYSQL_URL in the cluster's config map
-    let url = required_env("MYSQL_URL");
-    let (host, port) = url.split_once(':').expect("MYSQL_URL must be host:port");
-    let port = port
-        .parse()
-        .expect("the port of MYSQL_URL must be a number");
-
-    Pool::new(
-        OptsBuilder::default()
-            .ip_or_hostname(host)
-            .tcp_port(port)
-            .user(Some(required_env("MYSQL_USERNAME")))
-            .pass(Some(required_env("MYSQL_PASSWORD")))
-            .db_name(Some(required_env("MYSQL_DATABASE"))),
-    )
 }
 
 /// What the handlers share: most only need the database, sending an invite asks chat too, reporting a post kafka.
@@ -97,7 +79,7 @@ async fn main() {
     init_tracing();
 
     let state = AppState {
-        pool: mysql_pool(),
+        pool: db::pool(),
         grpc_client: GrpcClient::connect_lazy(GrpcClientConfig {
             // chat in this namespace, its grpc port: http://chat.holidayfriend.svc.cluster.local:50051
             chat_url: required_env("CHAT_GRPC_URL"),
