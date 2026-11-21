@@ -1,31 +1,19 @@
-//! Consumes the topic as sarama's consumer group does, a worker per partition: a post report is evaluated, and
-//! handed to the retry job when it can't be
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, SystemTime},
-};
+//! The topic's consumer, as onlineconversation's consumer package: what each record means, by its "taskType"
+//! header. a post report is evaluated, and handed to the retry job when it can't be. the polling, the workers and
+//! the commits are consumer_group's
+use std::{collections::HashMap, time::SystemTime};
 
-use async_trait::async_trait;
 use axum::extract::FromRef;
 use base64::{Engine, prelude::BASE64_STANDARD};
-use confluent_kafka::{
-    common::{Error, TopicPartition, header::Header, serialization::ByteArrayDeserializer},
-    consumer::{
-        Consumer, ConsumerConfig, ConsumerHandle, ConsumerRebalanceListener, ConsumerRecord,
-        KafkaConsumer, OffsetAndMetadata,
-    },
-};
+use confluent_kafka::{common::header::Header, consumer::ConsumerRecord};
 use mysql_async::Pool;
 use serde::Serialize;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    REPORT_POST_TASK, TASK_TYPE_HEADER, TOPIC, client_props,
+    REPORT_POST_TASK, TASK_TYPE_HEADER, TOPIC,
+    consumer_group::{self, ConsumerGroupHandler},
     producer::{self, Producer},
 };
 use crate::AppState;
@@ -38,334 +26,19 @@ const RETRY_TOPIC: &str = "exponential-backoff-retry";
 /// The header the retry job sets on a record it sends again
 const PARTITION_ID_HEADER: &str = "partitionId";
 
-/// A consumer of `group_id` that commits by itself, after a record is handled, and starts a new group from the
-/// oldest record so what came while it was down isn't skipped
-fn new(group_id: &str) -> KafkaConsumer<Vec<u8>, Vec<u8>> {
-    let mut props = client_props(group_id);
-    props.extend([
-        ("group.id".into(), group_id.into()),
-        // the only protocol the crate has, KIP-848. the crate's default is classic, which it refuses
-        ("group.protocol".into(), "consumer".into()),
-        ("enable.auto.commit".into(), "false".into()),
-        ("auto.offset.reset".into(), "earliest".into()),
-        ("max.poll.records".into(), MAX_POLL_RECORDS.to_string()),
-    ]);
-    let config = ConsumerConfig::new(&props).expect("invalid kafka consumer config");
-    KafkaConsumer::new(
-        config,
-        ByteArrayDeserializer::new(),
-        ByteArrayDeserializer::new(),
-    )
-    .expect("fail to create kafka consumer")
+/// Consumes the topic until `shutdown`, as onlineconversation's GetMessage
+pub async fn consume(state: AppState, shutdown: CancellationToken) {
+    consumer_group::run(GROUP_ID, TOPIC, Tasks { state }, shutdown).await;
 }
 
-/// Records a poll gives at most. a worker's queue is twice it, and a partition is paused while its queue has less
-/// room than it, so a poll never fills a queue
-const MAX_POLL_RECORDS: usize = 100;
-
-/// The worker of one partition: it takes the partition's records in order, as sarama's ConsumeClaim goroutine does
-struct Worker {
-    /// tells which worker a stuck report is from: a partition revoked and assigned again has a new one
-    id: u64,
-    records: mpsc::Sender<ConsumerRecord<Vec<u8>, Vec<u8>>>,
-    /// set when the partition is revoked: the record being handled is finished, the queued ones are dropped
-    stop: Arc<AtomicBool>,
-    task: JoinHandle<()>,
-}
-
-/// A worker gave up on the record at `offset`: it couldn't be handled or handed to the retry job
-struct Stuck {
-    partition: TopicPartition,
-    worker_id: u64,
-    offset: i64,
-}
-
-/// What the polling task, the workers and the rebalance listener share. never locked across an await
-#[derive(Default)]
-struct Shared {
-    workers: Mutex<HashMap<TopicPartition, Worker>>,
-    /// the next offset of each partition, after the records its worker finished, not committed yet
-    done: Mutex<HashMap<TopicPartition, i64>>,
-}
-
-/// Consumes the topic until the process ends, as sarama's consumer group does: this task polls, and hands each
-/// partition's records to its own worker, so the partitions are handled at once and each in order. a record is
-/// committed once it's handled or handed to the retry job, a record neither could take is read again from its offset
-pub async fn consume(state: AppState) {
-    let (group_id, topic) = (GROUP_ID, TOPIC);
-    let mut consumer = new(group_id);
-    let shared = Arc::new(Shared::default());
-    let listener = Arc::new(RebalanceListener {
-        consumer: consumer.handle(),
-        shared: shared.clone(),
-    });
-    consumer
-        .subscribe_with_topics_listener(vec![topic.to_string()], listener)
-        .await
-        .unwrap_or_else(|err| panic!("fail to subscribe to {topic}: {err}"));
-    tracing::info!(topic, group_id, "kafka consumer up and running");
-
-    let (stuck_sender, mut stuck_receiver) = mpsc::unbounded_channel::<Stuck>();
-    let mut next_worker_id = 0;
-    let mut paused: HashSet<TopicPartition> = HashSet::new();
-    loop {
-        // a stuck worker's partition is read again from the record it gave up on, by a new worker
-        while let Ok(Stuck {
-            partition,
-            worker_id,
-            offset,
-        }) = stuck_receiver.try_recv()
-        {
-            let removed = {
-                let mut workers = shared.workers.lock().unwrap();
-                match workers.get(&partition) {
-                    Some(worker) if worker.id == worker_id => workers.remove(&partition),
-                    // revoked meanwhile, its new owner reads it from the last commit
-                    _ => None,
-                }
-            };
-            if removed.is_none() {
-                continue;
-            }
-            if let Err(err) = consumer.seek_with_offset(partition.clone(), offset).await {
-                tracing::error!(error = %err, topic, "fail to seek back to the record");
-            }
-            if paused.remove(&partition)
-                && let Err(err) = consumer.resume(std::slice::from_ref(&partition)).await
-            {
-                tracing::error!(error = %err, topic, "fail to resume a partition");
-            }
-        }
-
-        // a partition whose worker couldn't take another poll waits for it, as sarama stops fetching a partition
-        // whose channel is full
-        let (to_pause, to_resume) = {
-            let workers = shared.workers.lock().unwrap();
-            // a revoked partition isn't paused any more
-            paused.retain(|partition| workers.contains_key(partition));
-            let mut to_pause = vec![];
-            let mut to_resume = vec![];
-            for (partition, worker) in workers.iter() {
-                let full = worker.records.capacity() < MAX_POLL_RECORDS;
-                if full && !paused.contains(partition) {
-                    to_pause.push(partition.clone());
-                } else if !full && paused.contains(partition) {
-                    to_resume.push(partition.clone());
-                }
-            }
-            (to_pause, to_resume)
-        };
-        if !to_pause.is_empty() {
-            match consumer.pause(&to_pause).await {
-                Ok(()) => paused.extend(to_pause),
-                Err(err) => tracing::error!(error = %err, topic, "fail to pause partitions"),
-            }
-        }
-        if !to_resume.is_empty() {
-            match consumer.resume(&to_resume).await {
-                Ok(()) => to_resume.iter().for_each(|partition| {
-                    paused.remove(partition);
-                }),
-                Err(err) => tracing::error!(error = %err, topic, "fail to resume partitions"),
-            }
-        }
-
-        // the rebalance listener runs in here, when the assignment changes
-        let records = match consumer.poll(Duration::from_secs(1)).await {
-            Ok(records) => records,
-            Err(err) => {
-                tracing::error!(error = %err, topic, "fail to poll");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-        for record in records {
-            let partition = TopicPartition::new(record.topic(), record.partition());
-            let sender = {
-                let mut workers = shared.workers.lock().unwrap();
-                workers
-                    .entry(partition.clone())
-                    .or_insert_with(|| {
-                        next_worker_id += 1;
-                        spawn_worker(&state, &shared, &stuck_sender, partition, next_worker_id)
-                    })
-                    .records
-                    .clone()
-            };
-            // never waits, the partition was paused before its queue could fill. a worker that gave up has closed
-            // its queue, its partition is sought back to the record it gave up on
-            let _ = sender.send(record).await;
-        }
-
-        // what the workers finished, as sarama's auto-commit does every second
-        let offsets: HashMap<TopicPartition, i64> =
-            std::mem::take(&mut *shared.done.lock().unwrap());
-        if !offsets.is_empty()
-            && let Err(err) = consumer
-                .commit_sync_with_offsets(offset_and_metadata(&offsets))
-                .await
-        {
-            // committed with the next, unless revoked meanwhile: read again and handled again then, so a task has
-            // to take a record twice
-            tracing::error!(error = %err, topic, "fail to commit");
-            let workers = shared.workers.lock().unwrap();
-            let mut done = shared.done.lock().unwrap();
-            for (partition, offset) in offsets {
-                if workers.contains_key(&partition) {
-                    let next = done.entry(partition).or_insert(offset);
-                    *next = (*next).max(offset);
-                }
-            }
-        }
-    }
-}
-
-fn spawn_worker(
-    state: &AppState,
-    shared: &Arc<Shared>,
-    stuck: &mpsc::UnboundedSender<Stuck>,
-    partition: TopicPartition,
-    id: u64,
-) -> Worker {
-    let (records, receiver) = mpsc::channel(MAX_POLL_RECORDS * 2);
-    let stop = Arc::new(AtomicBool::new(false));
-    let task = tokio::spawn(work(
-        state.clone(),
-        shared.clone(),
-        stuck.clone(),
-        partition,
-        id,
-        receiver,
-        stop.clone(),
-    ));
-    Worker {
-        id,
-        records,
-        stop,
-        task,
-    }
-}
-
-/// A partition's records, in order, until its queue is closed or the partition is revoked
-async fn work(
+/// onlineconversation's Consumer, the ConsumerGroupHandler: the app's state, as a handler's
+struct Tasks {
     state: AppState,
-    shared: Arc<Shared>,
-    stuck: mpsc::UnboundedSender<Stuck>,
-    partition: TopicPartition,
-    id: u64,
-    mut records: mpsc::Receiver<ConsumerRecord<Vec<u8>, Vec<u8>>>,
-    stop: Arc<AtomicBool>,
-) {
-    while let Some(record) = records.recv().await {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if let Err(err) = handle(&state, &record).await {
-            tracing::error!(
-                error = %err,
-                topic = record.topic(),
-                partition = record.partition(),
-                offset = record.offset(),
-                "fail to hand a record to the retry job, it's read again"
-            );
-            // the retry topic or the broker is down, no use asking again right away
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let _ = stuck.send(Stuck {
-                partition,
-                worker_id: id,
-                offset: record.offset(),
-            });
-            return;
-        }
-        shared
-            .done
-            .lock()
-            .unwrap()
-            .insert(partition.clone(), record.offset() + 1);
-    }
 }
 
-fn offset_and_metadata(
-    offsets: &HashMap<TopicPartition, i64>,
-) -> HashMap<TopicPartition, OffsetAndMetadata> {
-    offsets
-        .iter()
-        .map(|(partition, offset)| {
-            (
-                partition.clone(),
-                OffsetAndMetadata::new(*offset).expect("an offset is never negative"),
-            )
-        })
-        .collect()
-}
-
-/// What sarama does around a rebalance: a revoked partition's worker finishes the record it's on, and what it
-/// finished is committed before the partition goes, so its next owner starts after it. it runs in the polling task,
-/// inside poll, and reaches the consumer through its handle
-struct RebalanceListener {
-    consumer: ConsumerHandle,
-    shared: Arc<Shared>,
-}
-
-impl RebalanceListener {
-    fn take_workers(&self, partitions: &[TopicPartition]) -> Vec<Worker> {
-        let mut workers = self.shared.workers.lock().unwrap();
-        partitions
-            .iter()
-            .filter_map(|partition| workers.remove(partition))
-            .collect()
-    }
-
-    fn take_done(&self, partitions: &[TopicPartition]) -> HashMap<TopicPartition, i64> {
-        let mut done = self.shared.done.lock().unwrap();
-        partitions
-            .iter()
-            .filter_map(|partition| done.remove_entry(partition))
-            .collect()
-    }
-}
-
-#[async_trait]
-impl ConsumerRebalanceListener for RebalanceListener {
-    async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) -> Result<(), Error> {
-        for Worker {
-            records,
-            stop,
-            task,
-            ..
-        } in self.take_workers(partitions)
-        {
-            stop.store(true, Ordering::Relaxed);
-            // closes the queue, the worker ends after the record it's on
-            drop(records);
-            let _ = task.await;
-        }
-        let offsets = self.take_done(partitions);
-        if !offsets.is_empty()
-            && let Err(err) = self
-                .consumer
-                .commit_sync_with_offsets(offset_and_metadata(&offsets))
-                .await
-        {
-            // its next owner reads them again from the last commit
-            tracing::error!(error = %err, "fail to commit revoked partitions");
-        }
-        Ok(())
-    }
-
-    async fn on_partitions_assigned(&self, _partitions: &[TopicPartition]) -> Result<(), Error> {
-        // a worker starts with its partition's first record
-        Ok(())
-    }
-
-    async fn on_partitions_lost(&self, partitions: &[TopicPartition]) -> Result<(), Error> {
-        // already someone else's, nothing can be committed: the workers are stopped where they are, a transaction
-        // they're in rolls back
-        for worker in self.take_workers(partitions) {
-            worker.task.abort();
-        }
-        self.take_done(partitions);
-        Ok(())
+impl ConsumerGroupHandler for Tasks {
+    async fn handle(&self, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> Result<(), String> {
+        handle(&self.state, record).await
     }
 }
 

@@ -1,5 +1,6 @@
 //! The kafka cluster's clients, over mTLS with the kafka-user and cluster ca the reflector copies to this namespace
 pub mod consumer;
+pub mod consumer_group;
 pub mod producer;
 
 use std::{collections::HashMap, fs};
