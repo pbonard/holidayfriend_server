@@ -41,6 +41,9 @@ data:
   # holidayfriend-server asks it whether a reported post breaks the policy
   OLLAMA_URL: "http://ollama.llm.svc.cluster.local:11434"
   OLLAMA_MODEL: "qwen3:8b"
+  # a report that takes longer goes to the retry job. ollama loading the model cold took about a minute, a loaded
+  # one answers in under a second
+  OLLAMA_TIMEOUT_SECONDS: "180"
   # read at startup, change it here and restart holidayfriend-server, no image build. "none" is always added to the
   # categories, and the prompt injection guard is always appended to the policy (backend/src/moderation_client.rs)
   MODERATION_CATEGORIES: "hate,harassment,sexual,violent_threat,advertising,scam,manipulation,other"
