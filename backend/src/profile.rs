@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Query, State},
     http::StatusCode,
 };
 use mysql_async::Pool;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     cities,
     db::profile::{self, Profile, ProfileBasedIn, ShowBasedIn},
-    user::UserId,
+    id::{IdStruct, UserId},
 };
 
 const MAX_NAME: usize = 30;
@@ -184,11 +184,11 @@ pub struct ProfileResponse {
     fun_fact: String,
 }
 
-/// `GET /profile/{id}`. the person's own page shows only what they show others too
+/// `GET /profile?id=`. the person's own page shows only what they show others too
 pub async fn get(
     _: UserId,
     State(pool): State<Pool>,
-    Path(id): Path<Uuid>,
+    Query(IdStruct { id }): Query<IdStruct>,
 ) -> Result<Json<ProfileResponse>, (StatusCode, &'static str)> {
     let failed = |err: mysql_async::Error| {
         tracing::error!(error = %err, "fail to get profile");

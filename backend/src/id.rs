@@ -2,6 +2,7 @@ use axum::{
     extract::FromRequestParts,
     http::{StatusCode, request::Parts},
 };
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The member the gateway verified the access token of, it sets the header from the `sub` claim.
@@ -19,4 +20,11 @@ impl<S: Sync> FromRequestParts<S> for UserId {
             .map(UserId)
             .ok_or((StatusCode::UNAUTHORIZED, "Missing or invalid X-User-Id"))
     }
+}
+
+/// `{ "id": "..." }`: a body or query string that only names one thing, e.g. which post to get or which invite to
+/// accept, or a response that only gives back the id of what was made. `IdInterface` in the web app.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IdStruct {
+    pub id: Uuid,
 }
