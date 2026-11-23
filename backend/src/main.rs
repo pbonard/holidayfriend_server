@@ -97,8 +97,8 @@ async fn main() {
     // in this process, as onlineconversation's consumer is in its server: the reports are few, and it shares the
     // state with the handlers, the producer hands a failed report to the retry job
     let consumer = tokio::spawn(kafka::consumer::consume(state.clone(), shutdown.clone()));
-    // it returns only at shutdown. before it, it panicked, and the server shouldn't go on without it: the pod
-    // restarts instead
+    // it returns at shutdown. before it, it panicked or got a kafka error that won't pass, and the server shouldn't go
+    // on without it: the pod restarts instead
     let consumer = {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {

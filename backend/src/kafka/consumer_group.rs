@@ -63,7 +63,10 @@ const MAX_POLL_RECORDS: usize = 100;
 const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a worker whose handler gave an error waits before its partition is read again
 const STUCK_BACKOFF: Duration = Duration::from_secs(5);
-/// How long leaving the group may take at shutdown, within the pod's 30 seconds of grace
+/// How long a commit may take, retries included. the crate's default is 60 seconds, longer than the pod's 30 seconds of
+/// grace, and a poll loop in a commit doesn't see the shutdown
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long leaving the group may take at shutdown, after the last commits, within the pod's 30 seconds of grace
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The worker of one partition: it takes the partition's records in order, as sarama's ConsumeClaim goroutine does
@@ -106,7 +109,7 @@ struct Shared {
 /// and hands each partition's records to its own worker, which gives them to `handler` in order, so the partitions
 /// are handled at once. a record is committed once `handler` took it, a record it gave an error for is read again
 /// from its offset. at shutdown the workers stop, what they finished is committed and the group is left, as sarama's
-/// Close
+/// Close. it returns before `shutdown` when a poll's error won't pass: the caller has to take that as a failure
 pub async fn run<H: ConsumerGroupHandler>(
     group_id: &'static str,
     topic: &'static str,
@@ -202,10 +205,16 @@ pub async fn run<H: ConsumerGroupHandler>(
         // the rebalance listener runs in here, when the assignment changes
         let records = match consumer.poll(Duration::from_secs(1)).await {
             Ok(records) => records,
-            Err(err) => {
-                tracing::error!(error = %err, topic, "fail to poll");
+            Err(err) if may_recover(&err) => {
+                tracing::error!(error = %err, topic, "fail to poll, tried again");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
+            }
+            // a member that got a fatal error is out of the group for good: the error comes once, and the polls after
+            // it are only empty
+            Err(err) => {
+                tracing::error!(error = %err, topic, "fail to poll, the consumer stops");
+                break;
             }
         };
         // a partition whose records this round can't go to its worker: the rest of them are read again
@@ -286,6 +295,16 @@ pub async fn run<H: ConsumerGroupHandler>(
     }
 }
 
+/// Whether a later poll can work after `err`. a retriable one, and those that aren't but pass anyway: a member the
+/// coordinator doesn't know or whose epoch is old joins again by itself, and the crate keeps the member when the topic
+/// isn't authorized, for an ACL that comes later
+fn may_recover(err: &Error) -> bool {
+    err.is_retriable_error()
+        || err.is_unknown_member_id_error()
+        || err.is_stale_member_epoch_error()
+        || err.is_topic_authorization_error()
+}
+
 /// Commits what the workers finished. a failed commit is kept for the next one while the partition is still this
 /// consumer's, even when it has no worker for a moment (a stuck one was just replaced). a revoked one's is dropped:
 /// read again and handled again then, so a task has to take a record twice
@@ -295,7 +314,7 @@ async fn commit_done(consumer: &mut KafkaConsumer<Vec<u8>, Vec<u8>>, shared: &Sh
         return;
     }
     if let Err(err) = consumer
-        .commit_sync_with_offsets(offset_and_metadata(&offsets))
+        .commit_sync_with_offsets_timeout(offset_and_metadata(&offsets), COMMIT_TIMEOUT)
         .await
     {
         tracing::error!(error = %err, "fail to commit");
@@ -473,7 +492,7 @@ impl ConsumerRebalanceListener for RebalanceListener {
         if !offsets.is_empty()
             && let Err(err) = self
                 .consumer
-                .commit_sync_with_offsets(offset_and_metadata(&offsets))
+                .commit_sync_with_offsets_timeout(offset_and_metadata(&offsets), COMMIT_TIMEOUT)
                 .await
         {
             // its next owner reads them again from the last commit
