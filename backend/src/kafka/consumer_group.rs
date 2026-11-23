@@ -256,7 +256,13 @@ pub async fn run<H: ConsumerGroupHandler>(
                         }
                         Err(err) => {
                             tracing::error!(error = %err, topic, "fail to seek back to a record a worker had no room for");
-                            let _ = sender.send(record).await;
+                            tokio::select! {
+                                biased;
+                                // the rest of the poll is given up with it, so nothing after it is committed. it's
+                                // read again from the last commit
+                                () = shutdown.cancelled() => break,
+                                _ = sender.send(record) => {}
+                            }
                         }
                     }
                 }
@@ -297,12 +303,21 @@ pub async fn run<H: ConsumerGroupHandler>(
 
 /// Whether a later poll can work after `err`. a retriable one, and those that aren't but pass anyway: a member the
 /// coordinator doesn't know or whose epoch is old joins again by itself, and the crate keeps the member when the topic
-/// isn't authorized, for an ACL that comes later
+/// isn't authorized, for an ACL that comes later. a corrupt record doesn't pass, but a restart wouldn't help it and would
+/// take the server down with it, so it's tried again as sarama does
 fn may_recover(err: &Error) -> bool {
     err.is_retriable_error()
         || err.is_unknown_member_id_error()
         || err.is_stale_member_epoch_error()
         || err.is_topic_authorization_error()
+        || is_corrupt_record(err)
+}
+
+/// Whether `err` is of a record the crate fetched and couldn't read: a plain kafka error around the kafka error it got
+/// for the record. the crate's stopped background task is a plain one too, around nothing or an error that isn't
+/// kafka's, and is fatal
+fn is_corrupt_record(err: &Error) -> bool {
+    matches!(err, Error::KafkaError(_)) && err.source().is_some_and(Error::is_kafka_error)
 }
 
 /// Commits what the workers finished. a failed commit is kept for the next one while the partition is still this
