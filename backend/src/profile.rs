@@ -3,14 +3,23 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use mysql_async::Pool;
+use mysql_async::{Pool, TxOpts};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     cities,
-    db::profile::{self, Profile, ProfileBasedIn, ShowBasedIn},
+    db::{
+        outbox,
+        profile::{self, Profile, ProfileBasedIn, ShowBasedIn},
+        verdict::{self, Kind, NewVerdict},
+    },
     id::{IdStruct, UserId},
+    kafka::{
+        self,
+        producer::{self, Producer},
+    },
+    moderation_client::ModerationClient,
 };
 
 const MAX_NAME: usize = 30;
@@ -214,6 +223,110 @@ pub async fn get(
         birth_decade: profile.birth_decade,
         fun_fact: profile.fun_fact,
     }))
+}
+
+pub async fn report(
+    UserId(user_id): UserId,
+    State(producer): State<Producer>,
+    Json(IdStruct { id }): Json<IdStruct>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    if id == user_id {
+        return Err((StatusCode::BAD_REQUEST, "You can't report yourself"));
+    }
+    producer::send(
+        &producer,
+        kafka::TOPIC,
+        id.as_bytes(),
+        None,
+        vec![(
+            kafka::TASK_TYPE_HEADER.to_string(),
+            kafka::REPORT_PROFILE_TASK.as_bytes().to_vec(),
+        )],
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, profile_id = %id, "fail to report profile");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to report the profile",
+        )
+    })?;
+    tracing::info!(profile_id = %id, reporter_id = %user_id, "profile reported");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn manage_report(
+    pool: &Pool,
+    moderation_client: &ModerationClient,
+    profile_id: Uuid,
+) -> Result<(), String> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, profile_id = %profile_id, "fail to evaluate reported profile");
+        err.to_string()
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let Some(target) = profile::select_report_target(&mut conn, profile_id)
+        .await
+        .map_err(failed)?
+    else {
+        return Ok(());
+    };
+    if target.is_evaluated {
+        return Ok(());
+    }
+
+    let fields: Vec<(&str, &str)> = target
+        .fields
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let verdict = moderation_client.evaluate(&fields).await?;
+
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    let marked = profile::mark_evaluated_if_unchanged(&mut tx, profile_id, &target.updated_at)
+        .await
+        .map_err(failed)?;
+    if !marked {
+        tracing::info!(
+            profile_id = %profile_id,
+            violation = verdict.violation,
+            "profile changed during report evaluation"
+        );
+        if !verdict.violation {
+            return Err(
+                "profile contents was okay, but contents changed during report evaluation".into(),
+            );
+        }
+    }
+    verdict::insert(
+        &mut tx,
+        &NewVerdict {
+            kind: Kind::Profile,
+            target_id: profile_id,
+            user_id: profile_id,
+            content_updated_at: Some(target.updated_at.clone()),
+            contents: target.contents(),
+            model: moderation_client.model(),
+            verdict: &verdict,
+        },
+    )
+    .await
+    .map_err(failed)?;
+    if verdict.violation {
+        tracing::info!(
+            profile_id = %profile_id,
+            category = verdict.category,
+            "ban the owner of a violating profile"
+        );
+        outbox::publish_ban(&mut tx, profile_id)
+            .await
+            .map_err(failed)?;
+    }
+    tx.commit().await.map_err(failed)?;
+    Ok(())
 }
 
 #[cfg(test)]

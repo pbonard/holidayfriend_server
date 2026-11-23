@@ -12,11 +12,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    REPORT_POST_TASK, TASK_TYPE_HEADER, TOPIC,
+    REPORT_INVITE_TASK, REPORT_POST_TASK, REPORT_PROFILE_TASK, TASK_TYPE_HEADER, TOPIC,
     consumer_group::{self, ConsumerGroupHandler},
     producer::{self, Producer},
 };
-use crate::AppState;
+use crate::{AppState, invite::InviteReport};
 
 /// The consumer group, and the prefix of the retry job's partitionId of this group's failed records
 const GROUP_ID: &str = "holidayfriend";
@@ -76,6 +76,31 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
             // as a handler's State extractors take them. the moderation client is borrowed, a clone would copy its
             // policy
             crate::post::manage_report(&Pool::from_ref(state), &state.moderation, post_id).await
+        }
+        Some(REPORT_INVITE_TASK) => {
+            let id = record.key().and_then(|key| Uuid::from_slice(key).ok());
+            let report = record
+                .value()
+                .and_then(|value| serde_json::from_slice::<InviteReport>(value).ok());
+            let (Some(id), Some(report)) = (id, report) else {
+                tracing::error!(key = ?record.key(), "fail to parse invite report");
+                return Ok(());
+            };
+            crate::invite::manage_report(
+                &Pool::from_ref(state),
+                &state.moderation,
+                report.to_user_id,
+                id,
+            )
+            .await
+        }
+        Some(REPORT_PROFILE_TASK) => {
+            let Some(profile_id) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
+                tracing::error!(key = ?record.key(), "fail to parse profile report");
+                return Ok(());
+            };
+            crate::profile::manage_report(&Pool::from_ref(state), &state.moderation, profile_id)
+                .await
         }
         task_type => {
             tracing::warn!(task_type, "skip a record of an unknown task type");

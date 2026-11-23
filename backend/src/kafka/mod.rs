@@ -14,6 +14,9 @@ pub const TOPIC: &str = "holidayfriend";
 pub const TASK_TYPE_HEADER: &str = "taskType";
 /// A post report, keyed by the post's id
 pub const REPORT_POST_TASK: &str = "report-post";
+pub const REPORT_INVITE_TASK: &str = "report-invite";
+pub const REPORT_PROFILE_TASK: &str = "report-profile";
+pub const BAN_TASK: &str = "ban";
 
 /// The settings every client has: the broker, and the PEM files of the cluster ca and the user's certificate.
 /// the crate reads a keystore file as the certificate and the key together, strimzi gives them apart, so they go

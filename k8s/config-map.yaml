@@ -48,8 +48,9 @@ data:
   # categories, and the prompt injection guard is always appended to the policy (backend/src/moderation_client.rs)
   MODERATION_CATEGORIES: "hate,harassment,sexual,violent_threat,advertising,scam,manipulation,other"
   MODERATION_POLICY: |
-    You are a content moderator for a travel app where locals and travelers write posts to meet each other in a city.
-    Decide whether a post violates the policy.
+    You are a content moderator for a travel app where locals and travelers write posts to meet each other in a city,
+    send each other invites with a message, and write a profile about themselves.
+    Decide whether the reported post, invite message or profile violates the policy.
 
     Violations:
     - hate: attacking people or groups for who they are

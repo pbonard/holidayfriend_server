@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use mysql_async::{Conn, params, prelude::Queryable};
+use mysql_async::{Conn, Transaction, Value, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value as JsonValue};
 use uuid::Uuid;
 
 use crate::place::Place;
@@ -92,7 +93,8 @@ pub async fn upsert(
         best_trip = VALUES(best_trip),
         birth_decade = VALUES(birth_decade),
         fun_fact = VALUES(fun_fact),
-        show_based_in = VALUES(show_based_in)",
+        show_based_in = VALUES(show_based_in),
+        is_evaluated = FALSE",
         params! {
             "user_id" => user_id.as_bytes().to_vec(),
             "name" => profile.name,
@@ -308,6 +310,107 @@ pub async fn select_brief_profiles(
             )
         })
         .collect())
+}
+
+pub struct ReportTarget {
+    pub fields: Vec<(&'static str, String)>,
+    pub updated_at: Value,
+    pub is_evaluated: bool,
+}
+
+type ReportTargetRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Value,
+    bool,
+);
+
+impl ReportTarget {
+    pub fn contents(&self) -> JsonValue {
+        JsonValue::Object(
+            self.fields
+                .iter()
+                .map(|(name, value)| (name.to_string(), JsonValue::from(value.as_str())))
+                .collect::<Map<_, _>>(),
+        )
+    }
+}
+
+pub async fn select_report_target(
+    conn: &mut Conn,
+    id: Uuid,
+) -> mysql_async::Result<Option<ReportTarget>> {
+    let row: Option<ReportTargetRow> = conn
+        .exec_first(
+            r"-- sql
+    SELECT
+        name, about_me, grew_up_in, languages, dream_destination, obsession, local_spot, best_trip, birth_decade,
+        fun_fact, updated_at, is_evaluated
+    FROM profile
+    WHERE id = :id",
+            params! {
+                "id" => id.as_bytes().to_vec(),
+            },
+        )
+        .await?;
+    Ok(row.map(
+        |(
+            name,
+            about_me,
+            grew_up_in,
+            languages,
+            dream_destination,
+            obsession,
+            local_spot,
+            best_trip,
+            birth_decade,
+            fun_fact,
+            updated_at,
+            is_evaluated,
+        )| ReportTarget {
+            fields: vec![
+                ("Name", name),
+                ("About me", about_me),
+                ("I grew up in", grew_up_in),
+                ("Languages I speak", languages),
+                ("Where I've always wanted to go", dream_destination),
+                ("I'm obsessed with", obsession),
+                ("My favorite local spot", local_spot),
+                ("Best trip so far", best_trip),
+                ("Decade I was born", birth_decade),
+                ("My fun fact", fun_fact),
+            ],
+            updated_at,
+            is_evaluated,
+        },
+    ))
+}
+
+pub async fn mark_evaluated_if_unchanged(
+    tx: &mut Transaction<'_>,
+    id: Uuid,
+    updated_at: &Value,
+) -> mysql_async::Result<bool> {
+    tx.exec_drop(
+        r"-- sql
+    UPDATE profile
+    SET is_evaluated = TRUE, updated_at = updated_at
+    WHERE id = :id AND updated_at = :updated_at",
+        params! {
+            "id" => id.as_bytes().to_vec(),
+            "updated_at" => updated_at.clone(),
+        },
+    )
+    .await?;
+    Ok(tx.affected_rows() > 0)
 }
 
 #[cfg(test)]

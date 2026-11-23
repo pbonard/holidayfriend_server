@@ -7,15 +7,20 @@ use axum::{
 };
 use mysql_async::{Pool, TxOpts};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::{Builder, Uuid};
 
 use crate::{
     db::{
-        invite,
+        invite::{self, InviteStatus},
+        outbox,
         profile::{self, ProfileBasedIn},
+        verdict::{self, Kind, NewVerdict},
     },
     grpc_client::{GrpcClient, InviteCheck},
     id::{IdStruct, UserId},
+    kafka,
+    moderation_client::ModerationClient,
 };
 
 const MAX_MESSAGE: usize = 300;
@@ -247,7 +252,7 @@ pub async fn decline(
         )
     };
     let mut conn = pool.get_conn().await.map_err(failed)?;
-    let declined = invite::update_pending_to_declined(&mut conn, user_id, id)
+    let declined = invite::update_pending_to(&mut conn, user_id, id, InviteStatus::Declined)
         .await
         .map_err(failed)?;
     if !declined {
@@ -279,7 +284,7 @@ pub async fn accept(
         .await
         .map_err(failed)?;
     // the update first: it locks the row, so what's read next is the invite this accepted
-    if !invite::update_pending_to_accepted(&mut tx, user_id, id)
+    if !invite::update_pending_to(&mut tx, user_id, id, InviteStatus::Accepted)
         .await
         .map_err(failed)?
     {
@@ -312,7 +317,7 @@ pub async fn accept(
     // a struct of strings and bools always serializes
     .unwrap_or_default();
     // the message's id is the outbox row's, the kafka key and the id the chat keeps it by
-    invite::outbox_publish(
+    outbox::publish(
         &mut tx,
         message_id,
         user_id,
@@ -324,6 +329,105 @@ pub async fn accept(
     .map_err(failed)?;
     tx.commit().await.map_err(failed)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteReport {
+    pub to_user_id: Uuid,
+}
+
+pub async fn report(
+    UserId(user_id): UserId,
+    State(pool): State<Pool>,
+    Json(IdStruct { id }): Json<IdStruct>,
+) -> Result<StatusCode, (StatusCode, &'static str)> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, invite_id = %id, "fail to report invite");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to report the invite",
+        )
+    };
+    let payload = serde_json::to_string(&InviteReport {
+        to_user_id: user_id,
+    })
+    .unwrap_or_default();
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    if !invite::update_pending_to(&mut tx, user_id, id, InviteStatus::Reported)
+        .await
+        .map_err(failed)?
+    {
+        return Err((StatusCode::NOT_FOUND, "Invite not found"));
+    }
+    outbox::publish(
+        &mut tx,
+        id,
+        user_id,
+        kafka::TOPIC,
+        Some(kafka::REPORT_INVITE_TASK),
+        &payload,
+    )
+    .await
+    .map_err(failed)?;
+    tx.commit().await.map_err(failed)?;
+    tracing::info!(invite_id = %id, reporter_id = %user_id, "invite reported");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn manage_report(
+    pool: &Pool,
+    moderation_client: &ModerationClient,
+    to_user_id: Uuid,
+    id: Uuid,
+) -> Result<(), String> {
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, invite_id = %id, "fail to evaluate reported invite");
+        err.to_string()
+    };
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let Some((from_user_id, message)) = invite::select_report_target(&mut conn, to_user_id, id)
+        .await
+        .map_err(failed)?
+    else {
+        return Ok(());
+    };
+    let verdict = moderation_client.evaluate(&[("Message", &message)]).await?;
+
+    let mut tx = conn
+        .start_transaction(TxOpts::default())
+        .await
+        .map_err(failed)?;
+    verdict::insert(
+        &mut tx,
+        &NewVerdict {
+            kind: Kind::Invite,
+            target_id: id,
+            user_id: from_user_id,
+            content_updated_at: None,
+            contents: json!({ "message": message }),
+            model: moderation_client.model(),
+            verdict: &verdict,
+        },
+    )
+    .await
+    .map_err(failed)?;
+    if verdict.violation {
+        tracing::info!(
+            invite_id = %id,
+            category = verdict.category,
+            "ban the sender of a violating invite"
+        );
+        outbox::publish_ban(&mut tx, from_user_id)
+            .await
+            .map_err(failed)?;
+    }
+    tx.commit().await.map_err(failed)?;
+    Ok(())
 }
 
 /// `ChatMessage` of my-server's backend/common/payload.go. the ids are uuid strings, as serde writes a Uuid

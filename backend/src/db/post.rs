@@ -1,9 +1,8 @@
 use mysql_async::{Conn, Params, Transaction, Value, params, prelude::Queryable};
 use serde::Deserialize;
-use serde_json::json;
 use uuid::Uuid;
 
-use crate::{moderation_client::Verdict, place::Place};
+use crate::place::Place;
 
 // ER_DUP_ENTRY, vtgate passes the shard's error code through
 const DUPLICATE_ENTRY: u16 = 1062;
@@ -292,33 +291,6 @@ pub async fn mark_evaluated_if_unchanged(
 
 /// What the model said about a reported post, with the words it read, so a deleted post's reason stays. sharded by
 /// post_id like post, so it's one shard's transaction with marking or deleting the post
-pub async fn insert_verdict(
-    tx: &mut Transaction<'_>,
-    post_id: Uuid,
-    target: &ReportTarget,
-    model: &str,
-    verdict: &Verdict,
-) -> mysql_async::Result<()> {
-    let contents = json!({ "title": target.title, "body": target.body }).to_string();
-    let updated_at: Value = target.updated_at.clone();
-    tx.exec_drop(
-        r"-- sql
-    INSERT INTO post_verdict
-    (post_id, content_updated_at, contents, model, violation, category, reason)
-    VALUES (:post_id, :content_updated_at, :contents, :model, :violation, :category, :reason)",
-        params! {
-            "post_id" => post_id.as_bytes().to_vec(),
-            "content_updated_at" => updated_at,
-            contents,
-            model,
-            "violation" => verdict.violation,
-            "category" => &verdict.category,
-            "reason" => &verdict.reason,
-        },
-    )
-    .await
-}
-
 /// Hides the post from the person. marking it again is a no-op, so a retried
 /// request or a second tap succeeds too. sharded by user_id, so it's one shard's write
 pub async fn insert_not_interested(
