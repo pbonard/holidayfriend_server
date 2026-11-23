@@ -5,13 +5,16 @@ use axum::{
 };
 use mysql_async::{Pool, TxOpts};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
     cities,
     db::{
+        outbox,
         post::{self, NewPost, PostRole},
         profile::{self, ProfileBasedIn},
+        verdict::{self, Kind, NewVerdict},
     },
     id::{IdStruct, UserId},
     kafka::{
@@ -560,7 +563,7 @@ pub async fn manage_report(
     }
 
     let verdict = moderation_client
-        .evaluate(&target.title, &target.body)
+        .evaluate(&[("Title", &target.title), ("Body", &target.body)])
         .await?;
 
     // a failed step returns before commit, and dropping the transaction rolls it back
@@ -584,12 +587,17 @@ pub async fn manage_report(
         }
         // so when it "was" a violation, the post is deleted even when it was edited while the model read it
     }
-    post::insert_verdict(
+    verdict::insert(
         &mut tx,
-        post_id,
-        &target,
-        moderation_client.model(),
-        &verdict,
+        &NewVerdict {
+            kind: Kind::Post,
+            target_id: post_id,
+            user_id: target.user_id,
+            content_updated_at: Some(target.updated_at.clone()),
+            contents: json!({ "title": target.title, "body": target.body }),
+            model: moderation_client.model(),
+            verdict: &verdict,
+        },
     )
     .await
     .map_err(failed)?;
@@ -597,13 +605,16 @@ pub async fn manage_report(
         tracing::info!(
             post_id = %post_id,
             category = verdict.category,
-            "delete violating post"
+            "delete violating post and ban its author"
         );
         // by its author, as they would delete it. none when they deleted it meanwhile, its cities go either way
         post::delete(&mut tx, post_id, target.user_id)
             .await
             .map_err(failed)?;
         post::delete_places(&mut tx, post_id)
+            .await
+            .map_err(failed)?;
+        outbox::publish_ban(&mut tx, target.user_id)
             .await
             .map_err(failed)?;
     }

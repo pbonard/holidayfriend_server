@@ -114,6 +114,7 @@ async fn main() {
     let api: Router<AppState> = Router::new()
         .route("/profile", get(profile::get).put(profile::save))
         .route("/profile/brief/my", get(profile::get_my_brief))
+        .route("/profile/report", post(profile::report))
         .nest(
             "/post",
             Router::new()
@@ -138,7 +139,8 @@ async fn main() {
                 .route("/", post(invite::send))
                 .route("/list", get(invite::list))
                 .route("/accept", post(invite::accept))
-                .route("/decline", post(invite::decline)),
+                .route("/decline", post(invite::decline))
+                .route("/report", post(invite::report)),
         );
     let app = Router::new()
         .nest("/api", api)

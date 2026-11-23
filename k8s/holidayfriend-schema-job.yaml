@@ -25,6 +25,8 @@ data:
         -- how much of the based in shows on their posts: 'city' (and its country), 'country' or 'none'.
         -- one column so a city without its country can't be saved. profiles from before the choice show the city
         show_based_in     VARCHAR(10)  NOT NULL DEFAULT 'city',
+        updated_at        DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+        is_evaluated      BOOLEAN      NOT NULL DEFAULT FALSE,
         PRIMARY KEY (id)
     );
 
@@ -46,21 +48,19 @@ data:
         KEY (user_id)
     );
 
-    -- what the model said about a reported post, with the words it read: a violating post is deleted, its verdict stays.
-    -- sharded by post_id like post, so a verdict and marking or deleting its post are one shard's transaction
-    CREATE TABLE post_verdict
+    CREATE TABLE verdict
     (
-        post_id            BINARY(16)  NOT NULL,
+        kind               VARCHAR(10) NOT NULL,
+        target_id          BINARY(16)  NOT NULL,
+        user_id            BINARY(16)  NOT NULL,
         created_at         DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-        -- updated_at of the evaluated post
-        content_updated_at DATETIME(6) NOT NULL,
-        -- {"title", "body"}
+        content_updated_at DATETIME(6) NULL,
         contents           JSON        NOT NULL,
         model              VARCHAR(64) NOT NULL,
         violation          BOOLEAN     NOT NULL,
         category           VARCHAR(32) NOT NULL,
         reason             TEXT        NOT NULL,
-        PRIMARY KEY (post_id, created_at)
+        PRIMARY KEY (user_id, target_id, created_at)
     );
 
     -- a post's cities: where a traveler is going, often a few near each other,
@@ -109,7 +109,7 @@ data:
         to_user_id   BINARY(16)   NOT NULL,
         from_user_id BINARY(16)   NOT NULL,
         message      VARCHAR(300) NOT NULL,
-        -- 'pending', 'accepted' or 'declined'
+        -- 'pending', 'accepted', 'declined' or 'reported'
         status       VARCHAR(10)  NOT NULL DEFAULT 'pending',
         PRIMARY KEY (to_user_id, from_user_id),
         -- a person's requests by status, newest first: v7 ids are time ordered
@@ -185,10 +185,10 @@ data:
             }
           ]
         },
-        "post_verdict": {
+        "verdict": {
           "column_vindexes": [
             {
-              "column": "post_id",
+              "column": "user_id",
               "name": "binary_md5"
             }
           ]
