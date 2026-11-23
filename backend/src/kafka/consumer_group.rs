@@ -63,6 +63,9 @@ const MAX_POLL_RECORDS: usize = 100;
 const COMMIT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a worker whose handler gave an error waits before its partition is read again
 const STUCK_BACKOFF: Duration = Duration::from_secs(5);
+/// How long a consumer that can't read on is kept before a new one replaces it. the workers go on meanwhile, so a handler
+/// under way isn't cut off by every replacement. within the 5 minutes a consumer may go without a poll
+const REPLACE_BACKOFF: Duration = Duration::from_secs(60);
 /// How long a commit may take, retries included. the crate's default is 60 seconds, longer than the pod's 30 seconds of
 /// grace, and a poll loop in a commit doesn't see the shutdown
 const COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -117,6 +120,34 @@ pub async fn run<H: ConsumerGroupHandler>(
     shutdown: CancellationToken,
 ) {
     let handler = Arc::new(handler);
+    while let Ended::Unreadable = consume(group_id, topic, &handler, &shutdown).await {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        tracing::warn!(
+            topic,
+            group_id,
+            "a new kafka consumer replaces the one that couldn't read on"
+        );
+    }
+}
+
+/// Why a consumer ended
+enum Ended {
+    Shutdown,
+    /// it can't read on, a new one may
+    Unreadable,
+    /// a new one wouldn't get further
+    Fatal,
+}
+
+/// One consumer, from its subscription until it left the group
+async fn consume<H: ConsumerGroupHandler>(
+    group_id: &'static str,
+    topic: &'static str,
+    handler: &Arc<H>,
+    shutdown: &CancellationToken,
+) -> Ended {
     let mut consumer = new(group_id);
     let shared = Arc::new(Shared::default());
     let listener = Arc::new(RebalanceListener {
@@ -134,7 +165,17 @@ pub async fn run<H: ConsumerGroupHandler>(
     let mut unsought: Vec<Stuck> = vec![];
     let mut next_worker_id = 0;
     let mut last_commit = Instant::now();
-    while !shutdown.is_cancelled() {
+    let ended = loop {
+        if shutdown.is_cancelled() {
+            break Ended::Shutdown;
+        }
+        // what the workers finished, as sarama's auto-commit does every second. before the poll, so a poll that fails
+        // again and again doesn't keep it from being committed
+        if last_commit.elapsed() >= COMMIT_INTERVAL {
+            last_commit = Instant::now();
+            commit_done(&mut consumer, &shared).await;
+        }
+
         // a stuck worker's partition is read again from the record it gave up on. the worker stays, and its closed
         // queue keeps the partition paused, until the seek worked: a new worker takes it from there
         while let Ok(stuck) = stuck_receiver.try_recv() {
@@ -205,6 +246,16 @@ pub async fn run<H: ConsumerGroupHandler>(
         // the rebalance listener runs in here, when the assignment changes
         let records = match consumer.poll(Duration::from_secs(1)).await {
             Ok(records) => records,
+            // the crate keeps what it couldn't read and gives its error at every poll, for all the partitions. only a
+            // new consumer fetches it again, as sarama does after its backoff
+            Err(err) if is_unreadable(&err) => {
+                tracing::error!(error = %err, topic, "fail to poll, the consumer is replaced");
+                tokio::select! {
+                    () = shutdown.cancelled() => {}
+                    () = tokio::time::sleep(REPLACE_BACKOFF) => {}
+                }
+                break Ended::Unreadable;
+            }
             Err(err) if may_recover(&err) => {
                 tracing::error!(error = %err, topic, "fail to poll, tried again");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -214,7 +265,7 @@ pub async fn run<H: ConsumerGroupHandler>(
             // it are only empty
             Err(err) => {
                 tracing::error!(error = %err, topic, "fail to poll, the consumer stops");
-                break;
+                break Ended::Fatal;
             }
         };
         // a partition whose records this round can't go to its worker: the rest of them are read again
@@ -231,7 +282,7 @@ pub async fn run<H: ConsumerGroupHandler>(
                     .or_insert_with(|| {
                         next_worker_id += 1;
                         spawn_worker(
-                            &handler,
+                            handler,
                             &shared,
                             &stuck_sender,
                             partition.clone(),
@@ -256,7 +307,13 @@ pub async fn run<H: ConsumerGroupHandler>(
                         }
                         Err(err) => {
                             tracing::error!(error = %err, topic, "fail to seek back to a record a worker had no room for");
-                            let _ = sender.send(record).await;
+                            tokio::select! {
+                                biased;
+                                // the rest of the poll is given up with it, so nothing after it is committed. it's
+                                // read again from the last commit
+                                () = shutdown.cancelled() => break,
+                                _ = sender.send(record) => {}
+                            }
                         }
                     }
                 }
@@ -267,17 +324,11 @@ pub async fn run<H: ConsumerGroupHandler>(
                 }
             }
         }
-
-        // what the workers finished, as sarama's auto-commit does every second
-        if last_commit.elapsed() >= COMMIT_INTERVAL {
-            last_commit = Instant::now();
-            commit_done(&mut consumer, &shared).await;
-        }
-    }
+    };
 
     // as sarama's Close: the workers stop, what they finished is committed, and the group is left so the partitions
     // go to the other members at once instead of after the session times out
-    tracing::info!(topic, group_id, "kafka consumer shutting down");
+    tracing::info!(topic, group_id, "kafka consumer closing");
     let workers: Vec<Worker> = shared
         .workers
         .lock()
@@ -293,6 +344,7 @@ pub async fn run<H: ConsumerGroupHandler>(
     {
         tracing::error!(error = %err, topic, "fail to close the kafka consumer");
     }
+    ended
 }
 
 /// Whether a later poll can work after `err`. a retriable one, and those that aren't but pass anyway: a member the
@@ -303,6 +355,13 @@ fn may_recover(err: &Error) -> bool {
         || err.is_unknown_member_id_error()
         || err.is_stale_member_epoch_error()
         || err.is_topic_authorization_error()
+}
+
+/// Whether a new consumer may read on after `err`: a plain kafka error, which is what the crate gives for a corrupt
+/// record or batch, and for its background task having stopped, or a corrupt record's own, which the crate counts as
+/// retriable but keeps as well. the group's fatal errors have classes of their own
+fn is_unreadable(err: &Error) -> bool {
+    matches!(err, Error::KafkaError(_)) || err.is_corrupt_record_error()
 }
 
 /// Commits what the workers finished. a failed commit is kept for the next one while the partition is still this
