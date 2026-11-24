@@ -104,7 +104,8 @@ pub async fn select_author_for_update(
 }
 
 /// The post's own columns, already checked and trimmed. never user_id: a post stays its author's, and the
-/// post_user_id vindex is by it. the words may be new, so a report evaluates them again
+/// post_user_id vindex is by it. the words may be new, so a report evaluates them again.
+/// updated_at is always set: an edit of only the cities changes the row too, or the cdc-job wouldn't see it
 pub async fn update(
     tx: &mut Transaction<'_>,
     id: Uuid,
@@ -115,7 +116,8 @@ pub async fn update(
     tx.exec_drop(
         r"-- sql
     UPDATE post
-    SET role = :role, title = :title, body = :body, is_evaluated = FALSE
+    SET role = :role, title = :title, body = :body, is_evaluated = FALSE,
+        updated_at = CURRENT_TIMESTAMP(6)
     WHERE id = :id",
         params! {
             "id" => id.as_bytes().to_vec(),
