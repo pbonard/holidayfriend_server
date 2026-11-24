@@ -1,9 +1,11 @@
 mod cities;
 mod db;
+mod embedding_client;
 mod grpc_client;
 mod id;
 mod invite;
 mod kafka;
+mod milvus_client;
 mod moderation_client;
 mod place;
 mod post;
@@ -16,8 +18,10 @@ use axum::{
     extract::{FromRef, Request},
     routing::{get, post},
 };
+use embedding_client::EmbeddingClient;
 use grpc_client::{GrpcClient, GrpcClientConfig};
 use kafka::producer::Producer;
+use milvus_client::MilvusClient;
 use moderation_client::ModerationClient;
 use mysql_async::Pool;
 use tokio::signal::unix::{SignalKind, signal};
@@ -38,6 +42,8 @@ pub struct AppState {
     grpc_client: GrpcClient,
     producer: Producer,
     moderation: ModerationClient,
+    embedding: EmbeddingClient,
+    milvus: MilvusClient,
 }
 
 impl FromRef<AppState> for Pool {
@@ -87,7 +93,14 @@ async fn main() {
         }),
         producer: kafka::producer::new("holidayfriend-server"),
         moderation: ModerationClient::from_env(),
+        embedding: EmbeddingClient::from_env(),
+        milvus: MilvusClient::from_env(),
     };
+
+    // only logged: the server goes on without milvus, and indexing a post tries again
+    if let Err(err) = state.milvus.ensure_collection().await {
+        tracing::warn!(error = err, "milvus collection isn't ready");
+    }
 
     // SIGTERM from kubernetes or ctrl-c: the server stops taking requests and finishes its own, the consumer leaves
     // its group
@@ -104,7 +117,7 @@ async fn main() {
         tokio::spawn(async move {
             let result = consumer.await;
             if result.is_err() || !shutdown.is_cancelled() {
-                tracing::error!(error = ?result.err(), "report consumer stopped");
+                tracing::error!(error = ?result.err(), "consumer stopped");
                 std::process::exit(1);
             }
         })

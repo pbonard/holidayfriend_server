@@ -1,6 +1,6 @@
 //! The topic's consumer, as onlineconversation's consumer package: what each record means, by its "taskType"
-//! header. a post report is evaluated, and handed to the retry job when it can't be. the polling, the workers and
-//! the commits are consumer_group's
+//! header. a report is evaluated, a changed post indexed, and either is handed to the retry job when it can't be. the
+//! polling, the workers and the commits are consumer_group's
 use std::{collections::HashMap, time::SystemTime};
 
 use axum::extract::FromRef;
@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    REPORT_INVITE_TASK, REPORT_POST_TASK, REPORT_PROFILE_TASK, TASK_TYPE_HEADER, TOPIC,
+    INDEX_POST_TASK, REPORT_INVITE_TASK, REPORT_POST_TASK, REPORT_PROFILE_TASK, TASK_TYPE_HEADER,
+    TOPIC,
     consumer_group::{self, ConsumerGroupHandler},
     producer::{self, Producer},
 };
@@ -101,6 +102,20 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
             };
             crate::profile::manage_report(&Pool::from_ref(state), &state.moderation, profile_id)
                 .await
+        }
+        // only the key: the post is read as it is now, and a deleted one's value is null
+        Some(INDEX_POST_TASK) => {
+            let Some(post_id) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
+                tracing::error!(key = ?record.key(), "fail to parse post to index");
+                return Ok(());
+            };
+            crate::post::index(
+                &Pool::from_ref(state),
+                &state.embedding,
+                &state.milvus,
+                post_id,
+            )
+            .await
         }
         task_type => {
             tracing::warn!(task_type, "skip a record of an unknown task type");

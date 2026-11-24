@@ -16,11 +16,13 @@ use crate::{
         profile::{self, ProfileBasedIn},
         verdict::{self, Kind, NewVerdict},
     },
+    embedding_client::EmbeddingClient,
     id::{IdStruct, UserId},
     kafka::{
         self,
         producer::{self, Producer},
     },
+    milvus_client::{IndexedPost, MilvusClient},
     moderation_client::ModerationClient,
     place::Place,
 };
@@ -28,13 +30,15 @@ use crate::{
 // reddit's limits, the same as the maxLength of the web app's post form
 const MAX_TITLE: usize = 300;
 const MAX_BODY: usize = 40_000;
-const MAX_PLACES: usize = 10;
+pub const MAX_PLACES: usize = 10;
 // posts per page of a city's feed. a page shorter than this is the last one, the web app stops there
 const FEED_PAGE_SIZE: usize = 5;
 // the start of a post's body in the feed: more than a card's lines (the web app cuts it to them and adds …), the
 // whole body (up to MAX_BODY) is for the post's own page. characters and not bytes, so a multi-byte letter is never
 // cut in half
 const FEED_BODY_PREVIEW: usize = 650;
+/// characters of a post's body that are embedded: what it's about is said by then, and the model takes only so much
+const EMBEDDED_BODY: usize = 2_000;
 
 /// `CreatePostRequest` in the web app.
 #[derive(Debug, Deserialize)]
@@ -533,6 +537,44 @@ pub async fn report(
     })?;
     tracing::info!(post_id = %id, reporter_id = %user_id, "post reported");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The consumer's INDEX_POST_TASK: the post as it is now goes to milvus, or leaves it when it's gone. doing it again is
+/// fine, so a rebalance, a shutdown or the retry job can repeat it. an error is why it failed
+pub async fn index(
+    pool: &Pool,
+    embedding: &EmbeddingClient,
+    milvus: &MilvusClient,
+    post_id: Uuid,
+) -> Result<(), String> {
+    let found = {
+        // given back before the model is called, that can take seconds
+        let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+        post::select_post(&mut conn, post_id)
+            .await
+            .map_err(|err| err.to_string())?
+    };
+    let Some(post) = found else {
+        return milvus.delete_post(post_id).await;
+    };
+    let vector = embedding
+        .embed(&embedded_text(&post.title, &post.body))
+        .await?;
+    milvus
+        .upsert_post(&IndexedPost::new(
+            post.id,
+            post.user_id,
+            &post.role,
+            &post.places,
+            vector,
+        ))
+        .await
+}
+
+/// Not its cities: a search filters by them, and two posts aren't alike for being in the same one
+fn embedded_text(title: &str, body: &str) -> String {
+    let body: String = body.chars().take(EMBEDDED_BODY).collect();
+    format!("{title}\n\n{body}")
 }
 
 /// A reported post, the report consumer's REPORT_POST_TASK, as howwasread-server's onlineconversation evaluates a

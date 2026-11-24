@@ -41,6 +41,10 @@ data:
   # holidayfriend-server asks it whether a reported post breaks the policy
   OLLAMA_URL: "http://ollama.llm.svc.cluster.local:11434"
   OLLAMA_MODEL: "qwen3:8b"
+  # turns a post into a vector of 1024 numbers (backend/src/embedding_client.rs), another model needs a new collection
+  OLLAMA_EMBEDDING_MODEL: "bge-m3"
+  # the vectors of the posts
+  MILVUS_URL: "http://milvus-milvus.milvus.svc.cluster.local:19530"
   # a report that takes longer goes to the retry job. ollama loading the model cold took about a minute, a loaded
   # one answers in under a second
   OLLAMA_TIMEOUT_SECONDS: "180"
