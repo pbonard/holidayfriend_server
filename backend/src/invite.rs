@@ -93,6 +93,10 @@ pub async fn send(
         .validate(from_user_id)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to invite");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to invite")
+    };
     let mut conn = pool.get_conn().await.map_err(failed)?;
     // the recipient's requests show the sender's name, which is on their profile
     if !profile::exists(&mut conn, from_user_id)
@@ -150,11 +154,6 @@ pub async fn send(
     }
     // there's one already, too recent to send again
     Err((StatusCode::CONFLICT, ALREADY_INVITED))
-}
-
-fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
-    tracing::error!(error = %err, "fail to invite");
-    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to invite")
 }
 
 fn now_millis() -> u64 {
@@ -385,10 +384,7 @@ pub async fn manage_report(
     to_user_id: Uuid,
     id: Uuid,
 ) -> Result<(), String> {
-    let failed = |err: mysql_async::Error| {
-        tracing::error!(error = %err, invite_id = %id, "fail to evaluate reported invite");
-        err.to_string()
-    };
+    let failed = |err: mysql_async::Error| err.to_string();
     let mut conn = pool.get_conn().await.map_err(failed)?;
     let Some((from_user_id, message)) = invite::select_report_target(&mut conn, to_user_id, id)
         .await
