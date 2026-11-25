@@ -67,13 +67,21 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
         .and_then(|header| header.value())
         .map(String::from_utf8_lossy);
     // every task's key is the target's id. a key that isn't one is dropped, retrying won't fix it
-    let Some(kafka_key) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
-        tracing::error!(
-            task_type = task_type.as_deref(),
-            key = ?record.key(),
-            "fail to parse record key"
-        );
-        return Ok(());
+    let kafka_key = match record
+        .key()
+        .ok_or_else(|| "missing key".to_string())
+        .and_then(|key| Uuid::from_slice(key).map_err(|err| err.to_string()))
+    {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                task_type = task_type.as_deref(),
+                key = ?record.key(),
+                "fail to parse record key"
+            );
+            return Ok(());
+        }
     };
     // a task's error is why it failed, the record goes to the retry job with it
     let result = match task_type.as_deref() {
@@ -83,12 +91,17 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
             crate::post::manage_report(&Pool::from_ref(state), &state.moderation, kafka_key).await
         }
         Some(REPORT_INVITE_TASK) => {
-            let Some(report) = record
+            let report = match record
                 .value()
-                .and_then(|value| serde_json::from_slice::<InviteReport>(value).ok())
-            else {
-                tracing::error!(id = %kafka_key, "fail to parse invite report");
-                return Ok(());
+                .ok_or_else(|| "missing value".to_string())
+                .and_then(|value| {
+                    serde_json::from_slice::<InviteReport>(value).map_err(|err| err.to_string())
+                }) {
+                Ok(report) => report,
+                Err(err) => {
+                    tracing::error!(error = %err, %kafka_key, "fail to parse invite report");
+                    return Ok(());
+                }
             };
             crate::invite::manage_report(
                 &Pool::from_ref(state),

@@ -118,22 +118,22 @@ impl ModerationClient {
             .json(&request)
             .send()
             .await
-            .map_err(|err| format!("fail to call ollama: {err}"))?;
+            .map_err(|err| format!("ollama: fail to call chat: {err}"))?;
         if !response.status().is_success() {
-            return Err(format!("ollama returned status {}", response.status()));
+            return Err(format!("ollama: chat returned status {}", response.status()));
         }
         let response: ChatResponse = response
             .json()
             .await
-            .map_err(|err| format!("fail to read the ollama response: {err}"))?;
+            .map_err(|err| format!("ollama: fail to read response: {err}"))?;
         // "length" cuts the json off
         if response.done_reason != "stop" {
-            return Err(format!("ollama stopped with {:?}", response.done_reason));
+            return Err(format!("ollama: stopped with {:?}", response.done_reason));
         }
         // content is the verdict json as a string
         serde_json::from_str(&response.message.content).map_err(|err| {
             format!(
-                "fail to parse verdict ({}): {err}",
+                "ollama: fail to parse verdict ({}): {err}",
                 response.message.content
             )
         })
