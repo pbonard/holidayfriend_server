@@ -10,12 +10,19 @@ use crate::{embedding_client::DIMENSION, place::Place, post::MAX_PLACES, require
 
 const POST: &str = "post";
 
-/// What a search is for: the posts like this one, which aren't it or the viewer's own
-pub struct RelatedTo<'a> {
-    pub post_id: Uuid,
-    pub viewer_id: Uuid,
+/// What a search is for: the posts like the vector, by the same kind of people
+pub struct Related<'a> {
+    pub vector: Vec<f32>,
     pub role: &'a str,
-    pub places: &'a [Place],
+    pub country: &'a str,
+    /// none for anywhere in the country
+    pub city: Option<&'a str>,
+}
+
+/// What a search leaves out: the viewer's own posts, and the one seen with those already found
+pub struct Excluded {
+    pub viewer_id: Uuid,
+    pub post_ids: Vec<Uuid>,
 }
 
 /// Milvus answers 200 to a failed request too, with a code that isn't 0
@@ -47,31 +54,26 @@ impl<'a> IndexedPost<'a> {
         places: &'a [Place],
         vector: Vec<f32>,
     ) -> Self {
+        let mut countries: Vec<&str> = places.iter().map(|place| place.country.as_str()).collect();
+        countries.sort_unstable();
+        countries.dedup();
         Self {
             id,
             user_id,
             role,
-            countries: countries_of(places),
-            cities: cities_of(places),
+            countries,
+            cities: places
+                .iter()
+                .map(|place| indexed_city(&place.country, &place.city))
+                .collect(),
             vector,
         }
     }
 }
 
-/// Each country once
-fn countries_of(places: &[Place]) -> Vec<&str> {
-    let mut countries: Vec<&str> = places.iter().map(|place| place.country.as_str()).collect();
-    countries.sort_unstable();
-    countries.dedup();
-    countries
-}
-
-/// With the country: the same city name can be in two countries
-fn cities_of(places: &[Place]) -> Vec<String> {
-    places
-        .iter()
-        .map(|place| format!("{}:{}", place.country, place.city))
-        .collect()
+/// A city as it's indexed, with the country: the same city name can be in two countries
+fn indexed_city(country: &str, city: &str) -> String {
+    format!("{country}:{city}")
 }
 
 #[derive(Clone)]
@@ -116,35 +118,9 @@ impl MilvusClient {
         Ok(())
     }
 
-    /// The ids of the posts most like the post, the nearest first: of its cities, then of its countries while there are
-    /// fewer than `limit`. none when it isn't indexed yet
-    pub async fn search_related(
-        &self,
-        related_to: &RelatedTo<'_>,
-        limit: usize,
-    ) -> Result<Vec<Uuid>, String> {
+    /// The vector of the post, none when it isn't indexed yet
+    pub async fn find_vector(&self, id: Uuid) -> Result<Option<Vec<f32>>, String> {
         self.ensure_collection().await?;
-        let Some(vector) = self.find_vector(related_to.post_id).await? else {
-            return Ok(Vec::new());
-        };
-        let cities = json!(cities_of(related_to.places)).to_string();
-        let mut ids = self
-            .search(
-                &vector,
-                &related_filter(related_to, &[], "cities", &cities),
-                limit,
-            )
-            .await?;
-        if ids.len() < limit {
-            let countries = json!(countries_of(related_to.places)).to_string();
-            let filter = related_filter(related_to, &ids, "countries", &countries);
-            let more = self.search(&vector, &filter, limit - ids.len()).await?;
-            ids.extend(more);
-        }
-        Ok(ids)
-    }
-
-    async fn find_vector(&self, id: Uuid) -> Result<Option<Vec<f32>>, String> {
         let mut found: Vec<VectorRow> = self
             .call(
                 "entities/query",
@@ -159,20 +135,22 @@ impl MilvusClient {
         Ok(found.pop().map(|row| row.vector))
     }
 
-    async fn search(
+    /// The ids of the posts most like the vector, the nearest first
+    pub async fn search_related(
         &self,
-        vector: &[f32],
-        filter: &str,
+        related_to: &Related<'_>,
+        excluded: &Excluded,
         limit: usize,
     ) -> Result<Vec<Uuid>, String> {
+        self.ensure_collection().await?;
         let found: Vec<IdRow> = self
             .call(
                 "entities/search",
                 &json!({
                     "collectionName": POST,
-                    "data": [vector],
+                    "data": [related_to.vector],
                     "annsField": "vector",
-                    "filter": filter,
+                    "filter": related_filter(related_to, excluded),
                     "limit": limit,
                     "outputFields": ["id"],
                 }),
@@ -244,15 +222,18 @@ fn rows_of<T: DeserializeOwned>(data: Value) -> Result<Vec<T>, String> {
     serde_json::from_value(data).map_err(|err| format!("fail to read the milvus rows: {err}"))
 }
 
-/// Of the same kind of people, in any of the places: `values` is a json array, which is how milvus writes a list too
-fn related_filter(related_to: &RelatedTo<'_>, found: &[Uuid], field: &str, values: &str) -> String {
-    let mut excluded = vec![related_to.post_id];
-    excluded.extend(found);
+/// milvus writes strings and lists as json does
+fn related_filter(related_to: &Related<'_>, excluded: &Excluded) -> String {
+    let (field, value) = match related_to.city {
+        Some(city) => ("cities", indexed_city(related_to.country, city)),
+        None => ("countries", related_to.country.to_owned()),
+    };
     format!(
-        "id not in {} and user_id != \"{}\" and role == {} and ARRAY_CONTAINS_ANY({field}, {values})",
-        json!(excluded),
-        related_to.viewer_id,
+        "id not in {} and user_id != \"{}\" and role == {} and ARRAY_CONTAINS({field}, {})",
+        json!(excluded.post_ids),
+        excluded.viewer_id,
         json!(related_to.role),
+        json!(value),
     )
 }
 
@@ -358,24 +339,26 @@ mod tests {
     }
 
     #[test]
-    fn filters_related_posts_by_role_and_place_without_what_is_found() {
-        let found = Uuid::from_u128(3);
-        let filter = related_filter(
-            &RelatedTo {
-                post_id: Uuid::from_u128(1),
-                viewer_id: Uuid::from_u128(2),
-                role: "traveler",
-                places: &[],
-            },
-            &[found],
-            "cities",
-            &json!(cities_of(&[place("JP", "Tokyo"), place("CN", "Xi'an")])).to_string(),
-        );
+    fn filters_related_posts_by_role_and_place_without_the_excluded() {
+        let mut related_to = Related {
+            vector: vec![],
+            role: "traveler",
+            country: "CN",
+            city: Some("Xi'an"),
+        };
+        let excluded = Excluded {
+            viewer_id: Uuid::from_u128(2),
+            post_ids: vec![Uuid::from_u128(1), Uuid::from_u128(3)],
+        };
         assert_eq!(
-            filter,
+            related_filter(&related_to, &excluded),
             "id not in [\"00000000-0000-0000-0000-000000000001\",\"00000000-0000-0000-0000-000000000003\"] \
              and user_id != \"00000000-0000-0000-0000-000000000002\" and role == \"traveler\" \
-             and ARRAY_CONTAINS_ANY(cities, [\"JP:Tokyo\",\"CN:Xi'an\"])"
+             and ARRAY_CONTAINS(cities, \"CN:Xi'an\")"
+        );
+        related_to.city = None;
+        assert!(
+            related_filter(&related_to, &excluded).ends_with("ARRAY_CONTAINS(countries, \"CN\")")
         );
     }
 
