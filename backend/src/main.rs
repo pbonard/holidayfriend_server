@@ -31,7 +31,10 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 fn required_env(name: &str) -> String {
-    env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+    env::var(name).unwrap_or_else(|_| {
+        tracing::error!("{name} is not set");
+        std::process::exit(1);
+    })
 }
 
 /// What the handlers share: most only need the database, sending an invite asks chat too, reporting a post kafka.
@@ -103,7 +106,10 @@ async fn main() {
         // a server without milvus doesn't start, the pod restarts until it's there
         milvus: MilvusClient::connect(&required_env("MILVUS_URL"))
             .await
-            .expect("fail to connect to milvus"),
+            .unwrap_or_else(|err| {
+                tracing::error!(error = err, "fail to connect to milvus");
+                std::process::exit(1);
+            }),
     };
 
     // SIGTERM from kubernetes or ctrl-c: the server stops taking requests and finishes its own, the consumer leaves
@@ -184,18 +190,29 @@ async fn main() {
         )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
+        .await
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "fail to bind 0.0.0.0:8080");
+            std::process::exit(1);
+        });
     tracing::info!("listening on 0.0.0.0:8080");
-    axum::serve(listener, app)
+    if let Err(err) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
-        .unwrap();
+    {
+        tracing::error!(error = %err, "fail to serve http");
+        std::process::exit(1);
+    }
     // waits for the consumer to leave its group and commit what its workers finished
     let _ = consumer.await;
 }
 
 async fn cancel_on_signal(shutdown: CancellationToken) {
-    let mut terminate = signal(SignalKind::terminate()).expect("fail to listen for SIGTERM");
+    let mut terminate = signal(SignalKind::terminate()).unwrap_or_else(|err| {
+        tracing::error!(error = %err, "fail to listen for SIGTERM");
+        std::process::exit(1);
+    });
     tokio::select! {
         _ = terminate.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
