@@ -1,14 +1,24 @@
-//! The posts' vectors in milvus, over its REST API. vitess has the posts, this only says which ones are alike
-use std::{sync::Arc, time::Duration};
+//! The posts' vectors in milvus, with its rust sdk over grpc. vitess has the posts, this only says which ones are alike
+use std::time::Duration;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
-use tokio::sync::OnceCell;
+use milvus::v2::{
+    error::Error,
+    prelude::{
+        ClientV2, CollectionSchema, ConnectConfig, ConsistencyLevel, CreateCollectionRequest,
+        DataType, DeleteRequest, FieldSchema, HasCollectionRequest, Ids, IndexParam, IndexType,
+        InsertRequest, MetricType, QueryRequest, RetryConfig, SearchRequest, SearchVectors,
+        TelemetryConfig, UpsertRequest,
+    },
+};
+use serde::Serialize;
+use serde_json::json;
 use uuid::Uuid;
 
-use crate::{embedding_client::DIMENSION, place::Place, post::MAX_PLACES, required_env};
+use crate::{embedding_client::DIMENSION, place::Place, post::MAX_PLACES};
 
 const POST: &str = "post";
+/// For connecting, and for a call with its retries. the sdk's own for a call is none: it would go on for minutes while milvus is away
+const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a search is for: the posts like the vector, by the same kind of people
 pub struct Related<'a> {
@@ -23,16 +33,6 @@ pub struct Related<'a> {
 pub struct Excluded {
     pub viewer_id: Uuid,
     pub post_ids: Vec<Uuid>,
-}
-
-/// Milvus answers 200 to a failed request too, with a code that isn't 0
-#[derive(Deserialize)]
-struct Response {
-    code: i64,
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    data: Value,
 }
 
 /// A post as it's indexed: its vector, and what a search filters by
@@ -78,61 +78,75 @@ fn indexed_city(country: &str, city: &str) -> String {
 
 #[derive(Clone)]
 pub struct MilvusClient {
-    http: reqwest::Client,
-    url: String,
-    /// set once the collection is known to be there, a failed check is tried again by the next call
-    collection_ready: Arc<OnceCell<()>>,
+    client: ClientV2,
 }
 
 impl MilvusClient {
-    pub fn from_env() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("fail to build the milvus http client"),
-            url: required_env("MILVUS_URL"),
-            collection_ready: Arc::default(),
+    /// Connects, and makes the collection when there's none. it connects again by itself when milvus goes away later
+    pub async fn connect(url: &str) -> Result<Self, String> {
+        let config = ConnectConfig::new()
+            .uri(url)
+            .connect_timeout(TIMEOUT)
+            .rpc_timeout(TIMEOUT)
+            .retry(
+                RetryConfig::new()
+                    .max_attempts(3)
+                    .max_retry_timeout(TIMEOUT),
+            )
+            // a heartbeat every 10 seconds, with the calls' metrics
+            .telemetry(TelemetryConfig::new().enabled(false));
+        let client = ClientV2::new(&config).await.map_err(failed_to("connect"))?;
+
+        let failed = failed_to("find the collection");
+        let has = HasCollectionRequest::builder()
+            .collection_name(POST)
+            .build()
+            .map_err(&failed)?;
+        if !client.has_collection(has).await.map_err(&failed)?.exists() {
+            client
+                .create_collection(build_post_collection_request()?)
+                .await
+                .map_err(failed_to("create the collection"))?;
         }
+        Ok(Self { client })
     }
 
     /// Adds the post, or replaces the one of its id
     pub async fn upsert_post(&self, post: &IndexedPost<'_>) -> Result<(), String> {
-        self.ensure_collection().await?;
-        self.call(
-            "entities/upsert",
-            &json!({ "collectionName": POST, "data": [post] }),
-        )
-        .await?;
+        let failed = failed_to("upsert a post");
+        let request = build_upsert_request(post)?;
+        self.client.upsert(request).await.map_err(failed)?;
         Ok(())
     }
 
     /// Deleting one that isn't there is fine
     pub async fn delete_post(&self, id: Uuid) -> Result<(), String> {
-        self.ensure_collection().await?;
-        self.call(
-            "entities/delete",
-            &json!({ "collectionName": POST, "filter": format!("id in [\"{id}\"]") }),
-        )
-        .await?;
+        let failed = failed_to("delete a post");
+        let request = DeleteRequest::builder()
+            .collection_name(POST)
+            .ids(Ids::VarChar(vec![id.to_string()]))
+            .build()
+            .map_err(&failed)?;
+        self.client.delete(request).await.map_err(failed)?;
         Ok(())
     }
 
     /// The vector of the post, none when it isn't indexed yet
     pub async fn find_vector(&self, id: Uuid) -> Result<Option<Vec<f32>>, String> {
-        self.ensure_collection().await?;
-        let mut found: Vec<VectorRow> = self
-            .call(
-                "entities/query",
-                &json!({
-                    "collectionName": POST,
-                    "filter": format!("id in [\"{id}\"]"),
-                    "outputFields": ["vector"],
-                }),
-            )
-            .await
-            .and_then(rows_of)?;
-        Ok(found.pop().map(|row| row.vector))
+        let failed = failed_to("find a vector");
+        let request = QueryRequest::builder()
+            .collection_name(POST)
+            .ids(Ids::VarChar(vec![id.to_string()]))
+            .output_fields(["vector"])
+            .consistency_level(ConsistencyLevel::Bounded)
+            .build()
+            .map_err(&failed)?;
+        let found = self.client.query(request).await.map_err(&failed)?;
+        let Some(row) = found.results().rows().map_err(&failed)?.next() else {
+            return Ok(None);
+        };
+        let vector = row.get_float_vector("vector").map_err(failed)?;
+        Ok(Some(vector.to_vec()))
     }
 
     /// The ids of the posts most like the vector, the nearest first
@@ -142,84 +156,55 @@ impl MilvusClient {
         excluded: &Excluded,
         limit: usize,
     ) -> Result<Vec<Uuid>, String> {
-        self.ensure_collection().await?;
-        let found: Vec<IdRow> = self
-            .call(
-                "entities/search",
-                &json!({
-                    "collectionName": POST,
-                    "data": [related_to.vector],
-                    "annsField": "vector",
-                    "filter": related_filter(related_to, excluded),
-                    "limit": limit,
-                    "outputFields": ["id"],
-                }),
-            )
-            .await
-            .and_then(rows_of)?;
-        Ok(found.into_iter().map(|row| row.id).collect())
-    }
-
-    /// Makes the collection when there's none, at startup, or by the next call when that failed
-    pub async fn ensure_collection(&self) -> Result<(), String> {
-        self.collection_ready
-            .get_or_try_init(|| async {
-                let found = self
-                    .call("collections/has", &json!({ "collectionName": POST }))
-                    .await?;
-                if found["has"].as_bool() != Some(true) {
-                    self.call("collections/create", &collection()).await?;
-                }
-                Ok(())
-            })
-            .await
-            .copied()
-    }
-
-    async fn call(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let response = self
-            .http
-            .post(format!("{}/v2/vectordb/{path}", self.url))
-            .json(body)
-            .send()
-            .await
-            .map_err(|err| format!("fail to call milvus {path}: {err}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "milvus {path} returned status {}",
-                response.status()
-            ));
+        let failed = failed_to("search posts");
+        let request = build_search_request(related_to, excluded, limit)?;
+        let found = self.client.search(request).await.map_err(&failed)?;
+        let mut ids = Vec::new();
+        // one result for the one vector
+        for result in found.results().iter() {
+            for row in result.rows().map_err(&failed)? {
+                let id = row.get_str("id").map_err(&failed)?;
+                ids.push(
+                    id.parse()
+                        .map_err(|err| format!("milvus has a post of id {id}: {err}"))?,
+                );
+            }
         }
-        let response: Response = response
-            .json()
-            .await
-            .map_err(|err| format!("fail to read the milvus {path} response: {err}"))?;
-        data_of(path, response)
+        Ok(ids)
     }
 }
 
-fn data_of(path: &str, response: Response) -> Result<Value, String> {
-    if response.code != 0 {
-        return Err(format!(
-            "milvus {path} returned code {}: {}",
-            response.code, response.message
-        ));
-    }
-    Ok(response.data)
+fn failed_to(what: &str) -> impl Fn(Error) -> String {
+    move |err| format!("milvus: fail to {what}: {err}")
 }
 
-#[derive(Deserialize)]
-struct VectorRow {
-    vector: Vec<f32>,
+fn build_upsert_request(post: &IndexedPost<'_>) -> Result<UpsertRequest, String> {
+    let failed = failed_to("make an upsert");
+    let insert = InsertRequest::builder()
+        .collection_name(POST)
+        .rows([json!(post)])
+        .build()
+        .map_err(&failed)?;
+    UpsertRequest::builder()
+        .insert(insert)
+        .build()
+        .map_err(failed)
 }
 
-#[derive(Deserialize)]
-struct IdRow {
-    id: Uuid,
-}
-
-fn rows_of<T: DeserializeOwned>(data: Value) -> Result<Vec<T>, String> {
-    serde_json::from_value(data).map_err(|err| format!("fail to read the milvus rows: {err}"))
+fn build_search_request(
+    related_to: &Related<'_>,
+    excluded: &Excluded,
+    limit: usize,
+) -> Result<SearchRequest, String> {
+    SearchRequest::builder()
+        .collection_name(POST)
+        .vector_field("vector")
+        .vectors(SearchVectors::Float(vec![related_to.vector.clone()]))
+        .filter(related_filter(related_to, excluded))
+        .limit(limit as i64)
+        .consistency_level(ConsistencyLevel::Bounded)
+        .build()
+        .map_err(failed_to("make a search"))
 }
 
 /// milvus writes strings and lists as json does
@@ -237,54 +222,51 @@ fn related_filter(related_to: &Related<'_>, excluded: &Excluded) -> String {
     )
 }
 
-/// Made with its index, so milvus loads it right away
-fn collection() -> Value {
-    let varchar = |name: &str, max_length: usize| {
-        json!({
-            "fieldName": name,
-            "dataType": "VarChar",
-            "elementTypeParams": { "max_length": max_length.to_string() },
-        })
+fn build_post_schema() -> CollectionSchema {
+    let varchar = |name: &str, max_length: u32| {
+        FieldSchema::new()
+            .name(name)
+            .data_type(DataType::VarChar)
+            .max_length(max_length)
     };
-    let varchars = |name: &str, max_length: usize| {
-        json!({
-            "fieldName": name,
-            "dataType": "Array",
-            "elementDataType": "VarChar",
-            "elementTypeParams": {
-                "max_capacity": MAX_PLACES.to_string(),
-                "max_length": max_length.to_string(),
-            },
-        })
+    let varchars = |name: &str, max_length: u32| {
+        FieldSchema::new()
+            .name(name)
+            .data_type(DataType::Array)
+            .element_type(DataType::VarChar)
+            .max_capacity(MAX_PLACES as u32)
+            .max_length(max_length)
     };
-    let mut id = varchar("id", 36);
-    id["isPrimary"] = json!(true);
-    json!({
-        "collectionName": POST,
-        "schema": {
-            "autoId": false,
-            "enableDynamicField": false,
-            "fields": [
-                id,
-                varchar("user_id", 36),
-                varchar("role", 10),
-                varchars("countries", 2),
-                // bytes and not characters: a country, a colon and post_place's 100 characters of up to 4 bytes
-                varchars("cities", 403),
-                {
-                    "fieldName": "vector",
-                    "dataType": "FloatVector",
-                    "elementTypeParams": { "dim": DIMENSION.to_string() },
-                },
-            ],
-        },
-        "indexParams": [{
-            "fieldName": "vector",
-            "indexName": "vector",
-            "indexType": "AUTOINDEX",
-            "metricType": "COSINE",
-        }],
-    })
+    CollectionSchema::new()
+        .enable_dynamic_field(false)
+        .add_field(varchar("id", 36).primary_key(true))
+        .add_field(varchar("user_id", 36))
+        .add_field(varchar("role", 10))
+        .add_field(varchars("countries", 2))
+        // bytes and not characters: a country, a colon and post_place's 100 characters of up to 4 bytes
+        .add_field(varchars("cities", 403))
+        .add_field(
+            FieldSchema::new()
+                .name("vector")
+                .data_type(DataType::FloatVector)
+                .dimension(DIMENSION as u32),
+        )
+}
+
+/// Made with its index, so the sdk loads it right away
+fn build_post_collection_request() -> Result<CreateCollectionRequest, String> {
+    CreateCollectionRequest::builder()
+        .collection_name(POST)
+        .schema(build_post_schema())
+        .index_param(
+            IndexParam::new()
+                .field_name("vector")
+                .index_name("vector")
+                .index_type(IndexType::AutoIndex)
+                .metric_type(MetricType::Cosine),
+        )
+        .build()
+        .map_err(failed_to("make the collection"))
 }
 
 #[cfg(test)]
@@ -319,23 +301,40 @@ mod tests {
     #[test]
     fn the_collection_has_every_field_of_a_post() {
         let post = IndexedPost::new(Uuid::nil(), Uuid::nil(), "local", &[], vec![]);
-        let post = serde_json::to_value(post).unwrap();
+        let post = json!(post);
         let mut sent: Vec<&str> = post
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
-        let collection = collection();
-        let mut fields: Vec<&str> = collection["schema"]["fields"]
-            .as_array()
-            .unwrap()
+        let schema = build_post_schema();
+        let mut fields: Vec<&str> = schema
+            .get_fields()
             .iter()
-            .map(|field| field["fieldName"].as_str().unwrap())
+            .map(|field| field.get_name())
             .collect();
         sent.sort_unstable();
         fields.sort_unstable();
         assert_eq!(sent, fields);
+    }
+
+    #[test]
+    fn the_requests_are_valid() {
+        let related_to = Related {
+            vector: vec![0.5; DIMENSION],
+            role: "local",
+            country: "KR",
+            city: None,
+        };
+        let excluded = Excluded {
+            viewer_id: Uuid::nil(),
+            post_ids: vec![Uuid::nil()],
+        };
+        let post = IndexedPost::new(Uuid::nil(), Uuid::nil(), "local", &[], vec![0.5; DIMENSION]);
+        assert!(build_post_collection_request().is_ok());
+        assert!(build_upsert_request(&post).is_ok());
+        assert!(build_search_request(&related_to, &excluded, 10).is_ok());
     }
 
     #[test]
@@ -359,36 +358,6 @@ mod tests {
         related_to.city = None;
         assert!(
             related_filter(&related_to, &excluded).ends_with("ARRAY_CONTAINS(countries, \"CN\")")
-        );
-    }
-
-    #[test]
-    fn reads_the_rows_of_a_search_and_a_query() {
-        let found: Vec<IdRow> = rows_of(json!([
-            { "distance": 0.6, "id": "01a20614-6eb4-755e-bb45-efc549a58861" },
-        ]))
-        .unwrap();
-        assert_eq!(
-            found[0].id.to_string(),
-            "01a20614-6eb4-755e-bb45-efc549a58861"
-        );
-        let found: Vec<VectorRow> =
-            rows_of(json!([{ "id": "x", "vector": [0.5, -0.25] }])).unwrap();
-        assert_eq!(found[0].vector, [0.5, -0.25]);
-        assert!(rows_of::<IdRow>(json!([])).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_code_other_than_0_is_an_error() {
-        let response = |body: &str| data_of("x", serde_json::from_str(body).unwrap());
-        assert_eq!(
-            response(r#"{"code":0,"data":{"has":true}}"#).unwrap()["has"],
-            json!(true)
-        );
-        assert!(
-            response(r#"{"code":1100,"message":"bad"}"#)
-                .unwrap_err()
-                .contains("1100: bad")
         );
     }
 }

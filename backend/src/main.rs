@@ -100,13 +100,11 @@ async fn main() {
         producer: kafka::producer::new("holidayfriend-server"),
         moderation: ModerationClient::from_env(),
         embedding: EmbeddingClient::from_env(),
-        milvus: MilvusClient::from_env(),
+        // a server without milvus doesn't start, the pod restarts until it's there
+        milvus: MilvusClient::connect(&required_env("MILVUS_URL"))
+            .await
+            .expect("fail to connect to milvus"),
     };
-
-    // only logged: the server goes on without milvus, and indexing a post tries again
-    if let Err(err) = state.milvus.ensure_collection().await {
-        tracing::warn!(error = err, "milvus collection isn't ready");
-    }
 
     // SIGTERM from kubernetes or ctrl-c: the server stops taking requests and finishes its own, the consumer leaves
     // its group
