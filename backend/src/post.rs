@@ -24,7 +24,7 @@ use crate::{
         self,
         producer::{self, Producer},
     },
-    milvus_client::{IndexedPost, MilvusClient, RelatedTo},
+    milvus_client::{Excluded, IndexedPost, MilvusClient, Related},
     moderation_client::ModerationClient,
     place::Place,
 };
@@ -350,14 +350,29 @@ pub async fn list(
     Ok(Json(feed_items(posts, &authors)))
 }
 
-/// `GET /post/related?id=`: the posts most like this one, by the same kind of people, for the row under its page. of
-/// its cities first, then of its countries. milvus says which and vitess has the posts, so one deleted since isn't there
+/// `GET /post/related?id=&country=&city=`: which post, and the city it's seen from
+#[derive(Debug, Deserialize)]
+pub struct ListRelatedQuery {
+    id: Uuid,
+    /// ISO 3166-1 alpha-2
+    country: String,
+    city: String,
+}
+
+/// `GET /post/related`: the posts most like this one, by the same kind of people, for the row under its page. of the
+/// city first, then of the rest of its country. milvus says which and vitess has the posts, so one deleted since isn't there
 pub async fn list_related(
     UserId(viewer_id): UserId,
     State(pool): State<Pool>,
     State(milvus): State<MilvusClient>,
-    Query(IdStruct { id }): Query<IdStruct>,
+    Query(query): Query<ListRelatedQuery>,
 ) -> Result<Json<Vec<PostFeedItem>>, (StatusCode, &'static str)> {
+    let country = query.country.trim();
+    let city = query.city.trim();
+    if !cities::is_city(country, city) {
+        return Err((StatusCode::BAD_REQUEST, "The city is invalid"));
+    }
+
     let error = (
         StatusCode::INTERNAL_SERVER_ERROR,
         "Failed to load related posts",
@@ -369,24 +384,42 @@ pub async fn list_related(
     let found = {
         // given back before milvus is asked
         let mut conn = pool.get_conn().await.map_err(failed)?;
-        post::select_post(&mut conn, id).await.map_err(failed)?
+        post::select_post(&mut conn, query.id)
+            .await
+            .map_err(failed)?
     };
     let post = found.ok_or((StatusCode::NOT_FOUND, "Post not found"))?;
-    let ids = milvus
-        .search_related(
-            &RelatedTo {
-                post_id: id,
-                viewer_id,
-                role: &post.role,
-                places: &post.places,
-            },
-            RELATED_POSTS,
-        )
+    let milvus_failed = |err: String| {
+        tracing::error!(error = err, "fail to search related posts");
+        error
+    };
+    let Some(vector) = milvus.find_vector(query.id).await.map_err(milvus_failed)? else {
+        // not indexed yet
+        return Ok(Json(Vec::new()));
+    };
+    let mut related_to = Related {
+        vector,
+        role: &post.role,
+        country,
+        city: Some(city),
+    };
+    let mut excluded = Excluded {
+        viewer_id,
+        post_ids: vec![query.id],
+    };
+    let mut ids = milvus
+        .search_related(&related_to, &excluded, RELATED_POSTS)
         .await
-        .map_err(|err| {
-            tracing::error!(error = err, "fail to search related posts");
-            error
-        })?;
+        .map_err(milvus_failed)?;
+    if ids.len() < RELATED_POSTS {
+        excluded.post_ids.extend(&ids);
+        related_to.city = None;
+        let rest = milvus
+            .search_related(&related_to, &excluded, RELATED_POSTS - ids.len())
+            .await
+            .map_err(milvus_failed)?;
+        ids.extend(rest);
+    }
     if ids.is_empty() {
         return Ok(Json(Vec::new()));
     }
