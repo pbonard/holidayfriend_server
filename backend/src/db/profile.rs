@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mysql_async::{Conn, Transaction, Value, params, prelude::Queryable};
 use serde::{Deserialize, Serialize};
@@ -269,14 +269,11 @@ pub async fn select_public_profile(
 /// id, name, and the based in country and city, NULL for what's hidden
 type BriefProfileRow = (Vec<u8>, String, Option<String>, Option<String>);
 
-/// The profiles of the people, by their id. one who's gone isn't there
+/// The profiles of the people, by their id, each asked for once. one who's gone isn't there
 pub async fn select_brief_profiles(
     conn: &mut Conn,
-    mut user_ids: Vec<Uuid>,
+    user_ids: HashSet<Uuid>,
 ) -> mysql_async::Result<HashMap<Uuid, BriefProfile>> {
-    // one author of several posts is asked for once
-    user_ids.sort();
-    user_ids.dedup();
     if user_ids.is_empty() {
         return Ok(HashMap::new());
     }
