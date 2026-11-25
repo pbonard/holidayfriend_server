@@ -70,6 +70,12 @@ impl FromRef<AppState> for ModerationClient {
     }
 }
 
+impl FromRef<AppState> for MilvusClient {
+    fn from_ref(state: &AppState) -> Self {
+        state.milvus.clone()
+    }
+}
+
 fn init_tracing() {
     // confluent-kafka logs every fetch at info under fetch_diag, twice a second even when there's nothing
     let filter = EnvFilter::try_from_default_env()
@@ -140,6 +146,7 @@ async fn main() {
                 )
                 .route("/list", get(post::list))
                 .route("/user", get(post::list_by_user))
+                .route("/related", get(post::list_related))
                 .route("/report", post(post::report))
                 .route(
                     "/not-interested",

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use axum::{
     Json,
     extract::{Query, State},
@@ -12,8 +14,8 @@ use crate::{
     cities,
     db::{
         outbox,
-        post::{self, NewPost, PostRole},
-        profile::{self, ProfileBasedIn},
+        post::{self, NewPost, PostRole, PostWithPlaces},
+        profile::{self, BriefProfile, ProfileBasedIn},
         verdict::{self, Kind, NewVerdict},
     },
     embedding_client::EmbeddingClient,
@@ -22,7 +24,7 @@ use crate::{
         self,
         producer::{self, Producer},
     },
-    milvus_client::{IndexedPost, MilvusClient},
+    milvus_client::{IndexedPost, MilvusClient, RelatedTo},
     moderation_client::ModerationClient,
     place::Place,
 };
@@ -37,6 +39,8 @@ const FEED_PAGE_SIZE: usize = 5;
 // whole body (up to MAX_BODY) is for the post's own page. characters and not bytes, so a multi-byte letter is never
 // cut in half
 const FEED_BODY_PREVIEW: usize = 650;
+/// posts of the row under a post's page
+const RELATED_POSTS: usize = 10;
 /// characters of a post's body that are embedded: what it's about is said by then, and the model takes only so much
 const EMBEDDED_BODY: usize = 2_000;
 
@@ -343,24 +347,89 @@ pub async fn list(
             .await
             .map_err(failed)?;
 
-    Ok(Json(
-        posts
-            .into_iter()
-            .map(|post| {
-                let author = authors.get(&post.user_id);
-                PostFeedItem {
-                    id: post.id,
-                    role: post.role,
-                    title: post.title,
-                    body: post.body,
-                    author_id: post.user_id,
-                    author_name: author.map(|author| author.name.clone()).unwrap_or_default(),
-                    author_based_in: author.and_then(|author| author.based_in.clone()),
-                    places: post.places,
-                }
-            })
-            .collect(),
-    ))
+    Ok(Json(feed_items(posts, &authors)))
+}
+
+/// `GET /post/related?id=`: the posts most like this one, by the same kind of people, for the row under its page. of
+/// its cities first, then of its countries. milvus says which and vitess has the posts, so one deleted since isn't there
+pub async fn list_related(
+    UserId(viewer_id): UserId,
+    State(pool): State<Pool>,
+    State(milvus): State<MilvusClient>,
+    Query(IdStruct { id }): Query<IdStruct>,
+) -> Result<Json<Vec<PostFeedItem>>, (StatusCode, &'static str)> {
+    let error = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to load related posts",
+    );
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to list related posts");
+        error
+    };
+    let found = {
+        // given back before milvus is asked
+        let mut conn = pool.get_conn().await.map_err(failed)?;
+        post::select_post(&mut conn, id).await.map_err(failed)?
+    };
+    let post = found.ok_or((StatusCode::NOT_FOUND, "Post not found"))?;
+    let ids = milvus
+        .search_related(
+            &RelatedTo {
+                post_id: id,
+                viewer_id,
+                role: &post.role,
+                places: &post.places,
+            },
+            RELATED_POSTS,
+        )
+        .await
+        .map_err(|err| {
+            tracing::error!(error = err, "fail to search related posts");
+            error
+        })?;
+    if ids.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let mut conn = pool.get_conn().await.map_err(failed)?;
+    let mut posts = post::select_posts(&mut conn, &ids, FEED_BODY_PREVIEW)
+        .await
+        .map_err(failed)?;
+    posts.sort_by_key(|post| ids.iter().position(|id| *id == post.id));
+    if posts.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    // the authors' profiles are sharded by their own id, so they're read apart instead of joined
+    let authors =
+        profile::select_brief_profiles(&mut conn, posts.iter().map(|post| post.user_id).collect())
+            .await
+            .map_err(failed)?;
+
+    Ok(Json(feed_items(posts, &authors)))
+}
+
+/// The posts as cards, with their authors
+fn feed_items(
+    posts: Vec<PostWithPlaces>,
+    authors: &HashMap<Uuid, BriefProfile>,
+) -> Vec<PostFeedItem> {
+    posts
+        .into_iter()
+        .map(|post| {
+            let author = authors.get(&post.user_id);
+            PostFeedItem {
+                id: post.id,
+                role: post.role,
+                title: post.title,
+                body: post.body,
+                author_id: post.user_id,
+                author_name: author.map(|author| author.name.clone()).unwrap_or_default(),
+                author_based_in: author.and_then(|author| author.based_in.clone()),
+                places: post.places,
+            }
+        })
+        .collect()
 }
 
 /// `GET /post/user?userId=`: whose posts, and the next page of them
@@ -454,7 +523,7 @@ pub async fn get(
         .await
         .map_err(failed)?
         .ok_or((StatusCode::NOT_FOUND, "Post not found"))?;
-    let authors = profile::select_brief_profiles(&mut conn, vec![post.user_id])
+    let authors = profile::select_brief_profiles(&mut conn, HashSet::from([post.user_id]))
         .await
         .map_err(failed)?;
     let author = authors.get(&post.user_id);

@@ -463,6 +463,40 @@ pub async fn select_post(conn: &mut Conn, id: Uuid) -> mysql_async::Result<Optio
     Ok(row.map(post_with_places))
 }
 
+/// The posts of ids that are still there, in no order, each with every one of its cities. vtgate sends it to the shards
+/// the ids are on. never empty, as delete_places_except
+pub async fn select_posts(
+    conn: &mut Conn,
+    ids: &[Uuid],
+    body_preview: usize,
+) -> mysql_async::Result<Vec<PostWithPlaces>> {
+    let rows: Vec<PostRow> = conn
+        .exec(
+            format!(
+                r"-- sql
+    SELECT
+        post.id,
+        post.user_id,
+        post.role,
+        post.title,
+        LEFT(post.body, {body_preview}),
+        JSON_ARRAYAGG(JSON_OBJECT('country', place.country, 'city', place.city))
+    FROM post
+    JOIN post_place AS place ON place.post_id = post.id
+    WHERE post.id IN ({})
+    GROUP BY post.id",
+                vec!["?"; ids.len()].join(", ")
+            ),
+            Params::Positional(
+                ids.iter()
+                    .map(|id| Value::from(id.as_bytes().to_vec()))
+                    .collect(),
+            ),
+        )
+        .await?;
+    Ok(rows.into_iter().map(post_with_places).collect())
+}
+
 fn post_with_places((id, user_id, role, title, body, places): PostRow) -> PostWithPlaces {
     PostWithPlaces {
         // BINARY(16), so always the 16 bytes of a uuid

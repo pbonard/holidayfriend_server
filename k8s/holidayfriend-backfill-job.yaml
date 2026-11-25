@@ -1,0 +1,97 @@
+# asks holidayfriend-server to index every post in milvus, as the cdc-job does for a changed one. applied by hand,
+# outside helm/ so argo cd doesn't run it. doing it again is fine: delete the job and apply, like after a new model
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: holidayfriend-backfill
+  namespace: holidayfriend
+data:
+  backfill.py: |
+    import os
+
+    import pymysql
+    from confluent_kafka import Producer
+
+    host, port = os.environ["MYSQL_URL"].split(":")
+    db = pymysql.connect(
+        host=host,
+        port=int(port),
+        user=os.environ["MYSQL_USERNAME"],
+        password=os.environ["MYSQL_PASSWORD"],
+        database=os.environ["MYSQL_DATABASE"],
+    )
+    with db.cursor() as cursor:
+        cursor.execute("SELECT id FROM post")
+        ids = [id for (id,) in cursor.fetchall()]
+    print(f"{len(ids)} posts", flush=True)
+
+    producer = Producer({
+        "bootstrap.servers": os.environ["KAFKA_ADDRESS"],
+        "security.protocol": "SSL",
+        "ssl.ca.location": os.environ["KAFKA_CA_CERT_PATH"],
+        "ssl.certificate.location": os.environ["KAFKA_USER_CERT_PATH"],
+        "ssl.key.location": os.environ["KAFKA_USER_KEY_PATH"],
+        # the java client's, so a post's event is in the same partition as the cdc-job's
+        "partitioner": "murmur2_random",
+        "acks": "all",
+    })
+    failed = []
+    for id in ids:
+        producer.produce(
+            "holidayfriend",
+            key=id,
+            value=b"{}",
+            headers={"taskType": b"index-post"},
+            on_delivery=lambda err, _: err and failed.append(err),
+        )
+    left = producer.flush(60)
+    if failed or left:
+        raise SystemExit(f"fail to send: {failed}, {left} not delivered")
+    print(f"{len(ids)} sent")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: holidayfriend-backfill
+  namespace: holidayfriend
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backfill
+          image: python:3.13-slim
+          command:
+            - sh
+            - -c
+            - pip install -q --no-cache-dir --root-user-action=ignore pymysql==1.1.1 confluent-kafka==2.6.1 && python /app/backfill.py
+          resources:
+            requests:
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          envFrom:
+            - configMapRef:
+                name: config-map
+            - secretRef:
+                name: mysql
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: kafka-user
+              mountPath: /cert/kafka/user
+              readOnly: true
+            - name: kafka-ca
+              mountPath: /cert/kafka/cluster
+              readOnly: true
+      volumes:
+        - name: app
+          configMap:
+            name: holidayfriend-backfill
+        - name: kafka-user
+          secret:
+            secretName: kafka-user
+        - name: kafka-ca
+          secret:
+            secretName: kafka-cluster-cluster-ca-cert
