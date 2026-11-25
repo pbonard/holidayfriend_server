@@ -260,10 +260,7 @@ pub async fn manage_report(
     moderation_client: &ModerationClient,
     profile_id: Uuid,
 ) -> Result<(), String> {
-    let failed = |err: mysql_async::Error| {
-        tracing::error!(error = %err, profile_id = %profile_id, "fail to evaluate reported profile");
-        err.to_string()
-    };
+    let failed = |err: mysql_async::Error| err.to_string();
     let mut conn = pool.get_conn().await.map_err(failed)?;
     let Some(target) = profile::select_report_target(&mut conn, profile_id)
         .await

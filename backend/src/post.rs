@@ -133,6 +133,10 @@ pub async fn create(
         .validate()
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
 
+    let failed = |err: mysql_async::Error| {
+        tracing::error!(error = %err, "fail to create post");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create post")
+    };
     let mut conn = pool.get_conn().await.map_err(failed)?;
     // every post has a city, so a city's posts are both its travelers' and its locals'.
     // a local's is copied, so their posts keep the city they were written in when they move
@@ -170,11 +174,6 @@ pub async fn create(
     tx.commit().await.map_err(failed)?;
 
     Ok((StatusCode::CREATED, Json(IdStruct { id: post_id })))
-}
-
-fn failed(err: mysql_async::Error) -> (StatusCode, &'static str) {
-    tracing::error!(error = %err, "fail to create post");
-    (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create post")
 }
 
 /// `UpdatePostRequest` in the web app: the post to change, and all of it again as the create form sends it
@@ -649,12 +648,13 @@ pub async fn index(
     milvus: &MilvusClient,
     post_id: Uuid,
 ) -> Result<(), String> {
+    let failed = |err: mysql_async::Error| err.to_string();
     let found = {
         // given back before the model is called, that can take seconds
-        let mut conn = pool.get_conn().await.map_err(|err| err.to_string())?;
+        let mut conn = pool.get_conn().await.map_err(failed)?;
         post::select_post(&mut conn, post_id)
             .await
-            .map_err(|err| err.to_string())?
+            .map_err(failed)?
     };
     let Some(post) = found else {
         return milvus.delete_post(post_id).await;
@@ -690,10 +690,7 @@ pub async fn manage_report(
     moderation_client: &ModerationClient,
     post_id: Uuid,
 ) -> Result<(), String> {
-    let failed = |err: mysql_async::Error| {
-        tracing::error!(error = %err, post_id = %post_id, "fail to evaluate reported post");
-        err.to_string()
-    };
+    let failed = |err: mysql_async::Error| err.to_string();
     let mut conn = pool.get_conn().await.map_err(failed)?;
     let Some(target) = post::select_report_target(&mut conn, post_id)
         .await

@@ -66,54 +66,49 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
         .find(|header| header.key() == TASK_TYPE_HEADER)
         .and_then(|header| header.value())
         .map(String::from_utf8_lossy);
+    // every task's key is the target's id. a key that isn't one is dropped, retrying won't fix it
+    let Some(kafka_key) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
+        tracing::error!(
+            task_type = task_type.as_deref(),
+            key = ?record.key(),
+            "fail to parse record key"
+        );
+        return Ok(());
+    };
     // a task's error is why it failed, the record goes to the retry job with it
     let result = match task_type.as_deref() {
-        // its key is the post's id. a key that isn't one is dropped, retrying won't fix it
         Some(REPORT_POST_TASK) => {
-            let Some(post_id) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
-                tracing::error!(key = ?record.key(), "fail to parse report");
-                return Ok(());
-            };
             // as a handler's State extractors take them. the moderation client is borrowed, a clone would copy its
             // policy
-            crate::post::manage_report(&Pool::from_ref(state), &state.moderation, post_id).await
+            crate::post::manage_report(&Pool::from_ref(state), &state.moderation, kafka_key).await
         }
         Some(REPORT_INVITE_TASK) => {
-            let id = record.key().and_then(|key| Uuid::from_slice(key).ok());
-            let report = record
+            let Some(report) = record
                 .value()
-                .and_then(|value| serde_json::from_slice::<InviteReport>(value).ok());
-            let (Some(id), Some(report)) = (id, report) else {
-                tracing::error!(key = ?record.key(), "fail to parse invite report");
+                .and_then(|value| serde_json::from_slice::<InviteReport>(value).ok())
+            else {
+                tracing::error!(id = %kafka_key, "fail to parse invite report");
                 return Ok(());
             };
             crate::invite::manage_report(
                 &Pool::from_ref(state),
                 &state.moderation,
                 report.to_user_id,
-                id,
+                kafka_key,
             )
             .await
         }
         Some(REPORT_PROFILE_TASK) => {
-            let Some(profile_id) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
-                tracing::error!(key = ?record.key(), "fail to parse profile report");
-                return Ok(());
-            };
-            crate::profile::manage_report(&Pool::from_ref(state), &state.moderation, profile_id)
+            crate::profile::manage_report(&Pool::from_ref(state), &state.moderation, kafka_key)
                 .await
         }
         // only the key: the post is read as it is now, and a deleted one's value is null
         Some(INDEX_POST_TASK) => {
-            let Some(post_id) = record.key().and_then(|key| Uuid::from_slice(key).ok()) else {
-                tracing::error!(key = ?record.key(), "fail to parse post to index");
-                return Ok(());
-            };
             crate::post::index(
                 &Pool::from_ref(state),
                 &state.embedding,
                 &state.milvus,
-                post_id,
+                kafka_key,
             )
             .await
         }
@@ -129,6 +124,8 @@ async fn handle(state: &AppState, record: &ConsumerRecord<Vec<u8>, Vec<u8>>) -> 
         topic = record.topic(),
         partition = record.partition(),
         offset = record.offset(),
+        task_type = task_type.as_deref(),
+        %kafka_key,
         reason,
         "record goes to the retry job"
     );

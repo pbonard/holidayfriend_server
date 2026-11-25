@@ -116,8 +116,10 @@ impl ModerationClient {
         }
         // content is the verdict json as a string
         serde_json::from_str(&response.message.content).map_err(|err| {
-            tracing::error!(error = %err, content = response.message.content, "fail to parse verdict");
-            format!("fail to parse verdict: {err}")
+            format!(
+                "fail to parse verdict ({}): {err}",
+                response.message.content
+            )
         })
     }
 }
