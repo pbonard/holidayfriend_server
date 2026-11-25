@@ -54,14 +54,14 @@ impl EmbeddingClient {
             .json(&json!({ "model": self.model, "input": text }))
             .send()
             .await
-            .map_err(|err| format!("fail to call ollama: {err}"))?;
+            .map_err(|err| format!("ollama: fail to call embed: {err}"))?;
         if !response.status().is_success() {
-            return Err(format!("ollama returned status {}", response.status()));
+            return Err(format!("ollama: embed returned status {}", response.status()));
         }
         let response: EmbedResponse = response
             .json()
             .await
-            .map_err(|err| format!("fail to read the ollama embedding: {err}"))?;
+            .map_err(|err| format!("ollama: fail to read embedding: {err}"))?;
         only_vector(response.embeddings)
     }
 }
@@ -71,7 +71,7 @@ fn only_vector(mut embeddings: Vec<Vec<f32>>) -> Result<Vec<f32>, String> {
     match embeddings.pop() {
         Some(vector) if embeddings.is_empty() && vector.len() == DIMENSION => Ok(vector),
         vector => Err(format!(
-            "ollama returned {} more embeddings and one of {:?} numbers",
+            "ollama: returned {} more embeddings and one of {:?} numbers",
             embeddings.len(),
             vector.map(|vector| vector.len())
         )),
