@@ -47,13 +47,19 @@ fn new(group_id: &str) -> KafkaConsumer<Vec<u8>, Vec<u8>> {
         ("auto.offset.reset".into(), "earliest".into()),
         ("max.poll.records".into(), MAX_POLL_RECORDS.to_string()),
     ]);
-    let config = ConsumerConfig::new(&props).expect("invalid kafka consumer config");
+    let config = ConsumerConfig::new(&props).unwrap_or_else(|err| {
+        tracing::error!(error = %err, "invalid kafka consumer config");
+        std::process::exit(1);
+    });
     KafkaConsumer::new(
         config,
         ByteArrayDeserializer::new(),
         ByteArrayDeserializer::new(),
     )
-    .expect("fail to create kafka consumer")
+    .unwrap_or_else(|err| {
+        tracing::error!(error = %err, "fail to create kafka consumer");
+        std::process::exit(1);
+    })
 }
 
 /// Records a poll gives at most. a worker's queue is twice it, and a partition is paused while its queue has less
@@ -154,10 +160,13 @@ async fn consume<H: ConsumerGroupHandler>(
         consumer: consumer.handle(),
         shared: shared.clone(),
     });
-    consumer
+    if let Err(err) = consumer
         .subscribe_with_topics_listener(vec![topic.to_string()], listener)
         .await
-        .unwrap_or_else(|err| panic!("fail to subscribe to {topic}: {err}"));
+    {
+        tracing::error!(error = %err, topic, "fail to subscribe");
+        std::process::exit(1);
+    }
     tracing::info!(topic, group_id, "kafka consumer up and running");
 
     let (stuck_sender, mut stuck_receiver) = mpsc::unbounded_channel::<Stuck>();

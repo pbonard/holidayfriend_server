@@ -24,14 +24,24 @@ pub struct EmbeddingClient {
 impl EmbeddingClient {
     pub fn from_env() -> Self {
         let url = required_env("OLLAMA_URL");
-        let timeout_seconds: u64 = required_env("OLLAMA_TIMEOUT_SECONDS")
-            .parse()
-            .expect("OLLAMA_TIMEOUT_SECONDS must be a number of seconds");
+        let timeout_seconds: u64 =
+            required_env("OLLAMA_TIMEOUT_SECONDS")
+                .parse()
+                .unwrap_or_else(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "OLLAMA_TIMEOUT_SECONDS must be a number of seconds"
+                    );
+                    std::process::exit(1);
+                });
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
                 .build()
-                .expect("fail to build the embedding http client"),
+                .unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "fail to build the embedding http client");
+                    std::process::exit(1);
+                }),
             url: format!("{url}/api/embed"),
             model: required_env("OLLAMA_EMBEDDING_MODEL"),
         }

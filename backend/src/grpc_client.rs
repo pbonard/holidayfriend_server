@@ -37,7 +37,10 @@ impl GrpcClient {
     /// A client of the servers in config. it connects on the first call, and again after the connection fails
     pub fn connect_lazy(config: GrpcClientConfig) -> Self {
         let channel = Channel::from_shared(config.chat_url)
-            .expect("chat_url must be a url")
+            .unwrap_or_else(|err| {
+                tracing::error!(error = %err, "chat_url must be a url");
+                std::process::exit(1);
+            })
             .connect_timeout(config.timeout)
             .timeout(config.timeout)
             .connect_lazy();

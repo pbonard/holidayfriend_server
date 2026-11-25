@@ -53,18 +53,31 @@ impl ModerationClient {
     pub fn from_env() -> Self {
         let url = required_env("OLLAMA_URL");
         let model = required_env("OLLAMA_MODEL");
-        let timeout_seconds: u64 = required_env("OLLAMA_TIMEOUT_SECONDS")
-            .parse()
-            .expect("OLLAMA_TIMEOUT_SECONDS must be a number of seconds");
+        let timeout_seconds: u64 =
+            required_env("OLLAMA_TIMEOUT_SECONDS")
+                .parse()
+                .unwrap_or_else(|err| {
+                    tracing::error!(
+                        error = %err,
+                        "OLLAMA_TIMEOUT_SECONDS must be a number of seconds"
+                    );
+                    std::process::exit(1);
+                });
         let mut categories: Vec<String> = required_env("MODERATION_CATEGORIES")
             .split(',')
             .map(str::trim)
             .filter(|category| !category.is_empty())
             .map(String::from)
             .collect();
-        assert!(!categories.is_empty(), "MODERATION_CATEGORIES is empty");
+        if categories.is_empty() {
+            tracing::error!("MODERATION_CATEGORIES is empty");
+            std::process::exit(1);
+        }
         let policy = required_env("MODERATION_POLICY").trim().to_string();
-        assert!(!policy.is_empty(), "MODERATION_POLICY is empty");
+        if policy.is_empty() {
+            tracing::error!("MODERATION_POLICY is empty");
+            std::process::exit(1);
+        }
         categories.insert(0, "none".into());
 
         Self {
@@ -72,7 +85,10 @@ impl ModerationClient {
                 // a timeout is an error, the report goes to the retryer
                 .timeout(Duration::from_secs(timeout_seconds))
                 .build()
-                .expect("fail to build the ollama http client"),
+                .unwrap_or_else(|err| {
+                    tracing::error!(error = %err, "fail to build the ollama http client");
+                    std::process::exit(1);
+                }),
             url: format!("{url}/api/chat"),
             model,
             policy: policy + POLICY_SUFFIX,

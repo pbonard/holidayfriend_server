@@ -26,7 +26,10 @@ pub const INDEX_POST_TASK: &str = "index-post";
 fn client_props(client_id: &str) -> HashMap<String, String> {
     let read = |name: &str| {
         let path = required_env(name);
-        fs::read_to_string(&path).unwrap_or_else(|err| panic!("fail to read {name} {path}: {err}"))
+        fs::read_to_string(&path).unwrap_or_else(|err| {
+            tracing::error!(error = %err, name, path, "fail to read kafka file");
+            std::process::exit(1);
+        })
     };
     HashMap::from([
         ("bootstrap.servers".into(), required_env("KAFKA_ADDRESS")),

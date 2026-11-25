@@ -14,10 +14,14 @@ use crate::required_env;
 pub fn pool() -> Pool {
     // host:port, the same format as MYSQL_URL in the cluster's config map
     let url = required_env("MYSQL_URL");
-    let (host, port) = url.split_once(':').expect("MYSQL_URL must be host:port");
-    let port = port
-        .parse()
-        .expect("the port of MYSQL_URL must be a number");
+    let Some((host, port)) = url.split_once(':') else {
+        tracing::error!("MYSQL_URL must be host:port");
+        std::process::exit(1);
+    };
+    let port = port.parse().unwrap_or_else(|err| {
+        tracing::error!(error = %err, "the port of MYSQL_URL must be a number");
+        std::process::exit(1);
+    });
 
     Pool::new(
         OptsBuilder::default()

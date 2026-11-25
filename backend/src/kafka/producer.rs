@@ -18,14 +18,20 @@ pub fn new(client_id: &str) -> Producer {
     let mut props = client_props(client_id);
     // a report is sent once and waited for, so the broker has it before the request answers
     props.insert("acks".into(), "all".into());
-    let config = ProducerConfig::new(&props).expect("invalid kafka producer config");
+    let config = ProducerConfig::new(&props).unwrap_or_else(|err| {
+        tracing::error!(error = %err, "invalid kafka producer config");
+        std::process::exit(1);
+    });
     Arc::new(
         KafkaProducer::new(
             config,
             ByteArraySerializer::new(),
             ByteArraySerializer::new(),
         )
-        .expect("fail to create kafka producer"),
+        .unwrap_or_else(|err| {
+            tracing::error!(error = %err, "fail to create kafka producer");
+            std::process::exit(1);
+        }),
     )
 }
 
